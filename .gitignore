@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.so
+
+venv/
+env/
+
+.DS_STORE
+Thumbs.db
+
+*.mp4
