@@ -2,8 +2,9 @@ __pycache__/
 *.py[cod]
 *.so
 
-venv/
+.venv/
 env/
+LR-ASD/
 
 .DS_STORE
 Thumbs.db

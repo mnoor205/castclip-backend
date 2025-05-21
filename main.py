@@ -18,11 +18,11 @@ import numpy as np
 from tqdm import tqdm
 import cv2
 import ffmpegcv
-from google.genai import types
 import pysubs2
 
 class ProcessVideoRequest(BaseModel):
     s3_key: str
+    clip_count: int = 1
 
 image = (modal.Image.from_registry(
     "nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.12")
@@ -328,10 +328,10 @@ class AiPodcastClipper:
         
         return json.dumps(segments)
     # config=types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=1080))
-    def identify_moments(self, transcript: dict):
+    def identify_moments(self, transcript: dict, clip_count: int):
 
         response = self.gemini_client.models.generate_content(model="gemini-2.5-flash-preview-05-20", 
-                                                              contents="""
+                                                              contents=f"""
     This is a podcast video transcript consisting of word, along with each words's start and end time. I am looking to create clips between a minimum of 20 and maximum of 60 seconds long. The clip should never exceed 60 seconds or be under 20 seconds.
 
     Your task is to find and extract stories, or question and their corresponding answers from the transcript.
@@ -343,7 +343,7 @@ class AiPodcastClipper:
      - Start and end timestamps of the clips should align perfectly with the sentence boundaries in the transcript.
      - Only use the start and end timestamps provided in the input. modifying timestamps is not allowed.
      - Format the output as a list of JSON objects, each representing a clip with 'start' and 'end' timestamps: [{"start": seconds, "end": seconds}, ...clip2, clip3]. The output should always be readable by the python json.loads function.
-     - Generate as many clips as possible, at least 3 but no more than 5.
+     - Generate exactly {clip_count} clips. This is the exact number requested by the user.
      - Aim to generate longer clips between 20-60 seconds, and ensure to include as much content from the context as viable.
     
     Avoid including:
@@ -359,6 +359,7 @@ class AiPodcastClipper:
     @modal.fastapi_endpoint(method="POST")
     def process_video(self, request: ProcessVideoRequest, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
         s3_key = request.s3_key
+        clip_count = max(1, min(5, request.clip_count))
 
         if token.credentials != os.environ["AUTH_TOKEN"]:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
@@ -386,7 +387,7 @@ class AiPodcastClipper:
 
         # 2. Identify moments for clips
         print("Identifying clip moments")
-        identified_moments_raw = self.identify_moments(transcript_segments)
+        identified_moments_raw = self.identify_moments(transcript_segments, clip_count)
 
         cleaned_json_string = identified_moments_raw.strip()
         if cleaned_json_string.startswith("```json"):
@@ -402,7 +403,7 @@ class AiPodcastClipper:
         print(clip_moments)
 
         # 3. Process Clips
-        for index, moment in enumerate(clip_moments[:]): # remove 3 in production
+        for index, moment in enumerate(clip_moments[:clip_count]):
             if "start" in moment and "end" in moment:
                 duration = moment["end"] - moment["start"]
                 if duration >= 10: 
