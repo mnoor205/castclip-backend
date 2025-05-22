@@ -19,6 +19,7 @@ from tqdm import tqdm
 import cv2
 import ffmpegcv
 import pysubs2
+from google.genai import types
 
 class ProcessVideoRequest(BaseModel):
     s3_key: str
@@ -327,10 +328,17 @@ class AiPodcastClipper:
                 })
         
         return json.dumps(segments)
-    # config=types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=1080))
+    
     def identify_moments(self, transcript: dict, clip_count: int):
+        print(str(transcript))
 
         response = self.gemini_client.models.generate_content(model="gemini-2.5-flash-preview-05-20", 
+                                                              config=types.GenerateContentConfig(safety_settings=[
+                                                                types.SafetySetting( category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"), 
+                                                                types.SafetySetting( category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE" ), 
+                                                                types.SafetySetting( category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE" ), 
+                                                                types.SafetySetting( category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"), 
+                                                              ]),
                                                               contents=f"""
     This is a podcast video transcript consisting of word, along with each words's start and end time. I am looking to create clips between a minimum of 20 and maximum of 60 seconds long. The clip should never exceed 60 seconds or be under 20 seconds.
 
@@ -342,7 +350,7 @@ class AiPodcastClipper:
      - Ensure that clips do not overlap with one another.
      - Start and end timestamps of the clips should align perfectly with the sentence boundaries in the transcript.
      - Only use the start and end timestamps provided in the input. modifying timestamps is not allowed.
-     - Format the output as a list of JSON objects, each representing a clip with 'start' and 'end' timestamps: [{"start": seconds, "end": seconds}, ...clip2, clip3]. The output should always be readable by the python json.loads function.
+     - Format the output as a list of JSON objects, each representing a clip with 'start' and 'end' timestamps: [{{"start": seconds, "end": seconds}}, ...clip2, clip3]. The output should always be readable by the python json.loads function.
      - Generate exactly {clip_count} clips. This is the exact number requested by the user.
      - Aim to generate longer clips between 20-60 seconds, and ensure to include as much content from the context as viable.
     
@@ -359,7 +367,7 @@ class AiPodcastClipper:
     @modal.fastapi_endpoint(method="POST")
     def process_video(self, request: ProcessVideoRequest, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
         s3_key = request.s3_key
-        clip_count = max(1, min(5, request.clip_count))
+        clip_count = request.clip_count
 
         if token.credentials != os.environ["AUTH_TOKEN"]:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
@@ -424,7 +432,8 @@ def main():
     url = ai_podcast_clipper.process_video.web_url
 
     payload = {
-        "s3_key": "test1/drake5min.mp4"
+        "s3_key": "3zhHBEDMtMIEiRshOHkFSV72wKfdKkKI/3da8790a-195b-4314-b940-bb5d8819f462/original.mp4",
+        "clip_count": 1
     }
     headers = {
         "Content-Type": "application/json",
