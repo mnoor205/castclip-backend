@@ -1,7 +1,8 @@
 import modal
 from fastapi import Depends, status, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, validator, Field
+from typing import Optional, Union
 import os
 import uuid
 import pathlib
@@ -20,10 +21,38 @@ import cv2
 import ffmpegcv
 import pysubs2
 from google.genai import types
+import yt_dlp
+import re
+import logging
 
 class ProcessVideoRequest(BaseModel):
-    s3_key: str
-    clip_count: int = 1
+    s3_key: Optional[str] = None
+    youtube_url: Optional[str] = None
+    clip_count: int = Field(default=1, ge=1, le=10)
+    
+    @validator('youtube_url')
+    def validate_youtube_url(cls, v):
+        if v is not None:
+            # Regex pattern for YouTube URLs
+            youtube_pattern = re.compile(
+                r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/'
+                r'(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
+            )
+            if not youtube_pattern.match(v):
+                raise ValueError('Invalid YouTube URL format')
+        return v
+    
+    @validator('s3_key', always=True)
+    def validate_input_source(cls, v, values):
+        s3_key = v
+        youtube_url = values.get('youtube_url')
+        
+        if not s3_key and not youtube_url:
+            raise ValueError('Either s3_key or youtube_url must be provided')
+        if s3_key and youtube_url:
+            raise ValueError('Provide either s3_key or youtube_url, not both')
+        
+        return v
 
 image = (modal.Image.from_registry(
     "nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.12")
@@ -200,10 +229,8 @@ def create_subtitles_with_ffmpeg(transcript_segments: list, clip_start: float, c
 
     subprocess.run(ffmpeg_cmd, shell=True, check=True)
   
-def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_time: float, end_time: float, clip_index: int, transcript_segments: list):
+def process_clip(base_dir: str, original_video_path: str, output_s3_key: str, start_time: float, end_time: float, clip_index: int, transcript_segments: list):
     clip_name = f"clip_{clip_index}"
-    s3_key_dir = os.path.dirname(s3_key)
-    output_s3_key = f"{s3_key_dir}/{clip_name}.mp4"
     print(f"Output S3 key: {output_s3_key}")
 
     clip_dir = base_dir / clip_name
@@ -293,6 +320,99 @@ class AiPodcastClipper:
         self.gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
         print("Generated Gemini Client")
 
+    def download_youtube_video(self, youtube_url: str, output_path: str) -> tuple[str, dict]:
+        """
+        Download a YouTube video using yt-dlp.
+        
+        Args:
+            youtube_url: The YouTube URL to download
+            output_path: Path where to save the video
+            
+        Returns:
+            tuple: (downloaded_file_path, video_info)
+        """
+        print(f"Downloading YouTube video: {youtube_url}")
+        
+        # Configure yt-dlp options for high quality video
+        ydl_opts = {
+            'format': 'best[height<=1080][ext=mp4]/best[ext=mp4]/best',
+            'outtmpl': output_path,
+            'writeinfojson': False,
+            'writesubtitles': False,
+            'writeautomaticsub': False,
+            'ignoreerrors': False,
+            'no_warnings': False,
+            'extractflat': False,
+            'writethumbnail': False,
+            'noplaylist': True,  # Only download the specific video, not playlist
+        }
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Extract video info first
+                info = ydl.extract_info(youtube_url, download=False)
+                
+                # Check duration (limit to reasonable podcast length)
+                duration = info.get('duration', 0)
+                if duration > 10800:  # 3 hours limit
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Video too long ({duration/3600:.1f} hours). Maximum allowed is 3 hours."
+                    )
+                
+                if duration < 60:  # 1 minute minimum
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Video too short ({duration} seconds). Minimum required is 1 minute."
+                    )
+                
+                print(f"Video info: Title='{info.get('title', 'Unknown')}', Duration={duration}s")
+                
+                # Download the video
+                ydl.download([youtube_url])
+                
+                return output_path, info
+                
+        except yt_dlp.DownloadError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to download YouTube video: {str(e)}"
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Unexpected error downloading video: {str(e)}"
+            )
+
+    def download_s3_video(self, s3_key: str, output_path: str) -> str:
+        """
+        Download a video from S3.
+        
+        Args:
+            s3_key: The S3 key for the video
+            output_path: Path where to save the video
+            
+        Returns:
+            str: The path to the downloaded video
+        """
+        print(f"Downloading video from S3: {s3_key}")
+        
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+            endpoint_url=os.environ["R2_ENDPOINT_URL"],
+            region_name="auto"
+        )
+        
+        try:
+            s3_client.download_file("ai-podcast-clipper", s3_key, output_path)
+            return output_path
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to download video from S3: {str(e)}"
+            )
 
     def transcribe_video(self, base_dir: str, video_path: str) -> str:
         audio_path = base_dir / 'audio.wav'
@@ -367,6 +487,7 @@ class AiPodcastClipper:
     @modal.fastapi_endpoint(method="POST")
     def process_video(self, request: ProcessVideoRequest, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
         s3_key = request.s3_key
+        youtube_url = request.youtube_url
         clip_count = request.clip_count
 
         if token.credentials != os.environ["AUTH_TOKEN"]:
@@ -377,71 +498,186 @@ class AiPodcastClipper:
         base_dir = pathlib.Path("/tmp") / run_id
         base_dir.mkdir(parents=True, exist_ok=True)
 
-        # Download Video
-        video_path = base_dir / "input.mp4"
-        s3_client = boto3.client(
-            "s3",
-            aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-            aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-            endpoint_url=os.environ["R2_ENDPOINT_URL"],
-            region_name="auto"  # Cloudflare R2 ignores region, but boto3 still requires it
-        )
-
-        s3_client.download_file("ai-podcast-clipper", s3_key, str(video_path))
+        video_info = None
+        video_source = None
         
-        # 1. Transcription
-        transcript_segments_json = self.transcribe_video(base_dir, video_path)
-        transcript_segments = json.loads(transcript_segments_json)
+        try:
+            # Download Video from appropriate source
+            video_path = base_dir / "input.mp4"
+            
+            if youtube_url:
+                video_source = "youtube"
+                print(f"Processing YouTube video: {youtube_url}")
+                video_path_str, video_info = self.download_youtube_video(youtube_url, str(video_path))
+                
+                # Generate S3 key for output based on YouTube video ID
+                video_id = video_info.get('id', run_id)
+                video_title = video_info.get('title', 'unknown')
+                # Sanitize title for use in S3 key
+                sanitized_title = re.sub(r'[^\w\-_\.]', '_', video_title)[:50]
+                output_s3_prefix = f"youtube/{video_id}/{sanitized_title}"
+                
+            elif s3_key:
+                video_source = "s3"
+                print(f"Processing S3 video: {s3_key}")
+                self.download_s3_video(s3_key, str(video_path))
+                output_s3_prefix = os.path.dirname(s3_key)
+            
+            print(f"Video downloaded successfully to: {video_path}")
+            
+            # 1. Transcription
+            print("Starting transcription...")
+            transcript_segments_json = self.transcribe_video(base_dir, video_path)
+            transcript_segments = json.loads(transcript_segments_json)
 
-        # 2. Identify moments for clips
-        print("Identifying clip moments")
-        identified_moments_raw = self.identify_moments(transcript_segments, clip_count)
+            # 2. Identify moments for clips
+            print("Identifying clip moments...")
+            identified_moments_raw = self.identify_moments(transcript_segments, clip_count)
 
-        cleaned_json_string = identified_moments_raw.strip()
-        if cleaned_json_string.startswith("```json"):
-            cleaned_json_string = cleaned_json_string[len("```json"):].strip()
-        if cleaned_json_string.endswith("```"):
-            cleaned_json_string = cleaned_json_string[:-len("```")].strip()
+            cleaned_json_string = identified_moments_raw.strip()
+            if cleaned_json_string.startswith("```json"):
+                cleaned_json_string = cleaned_json_string[len("```json"):].strip()
+            if cleaned_json_string.endswith("```"):
+                cleaned_json_string = cleaned_json_string[:-len("```")].strip()
 
-        clip_moments = json.loads(cleaned_json_string)
-        if not isinstance(clip_moments, list):
-            print("Error: Identified moments is not a list")
-            clip_moments = []
-        
-        print(clip_moments)
+            clip_moments = json.loads(cleaned_json_string)
+            if not isinstance(clip_moments, list):
+                print("Error: Identified moments is not a list")
+                clip_moments = []
+            
+            print(f"Found {len(clip_moments)} potential clips")
 
-        # 3. Process Clips
-        for index, moment in enumerate(clip_moments[:clip_count]):
-            if "start" in moment and "end" in moment:
-                duration = moment["end"] - moment["start"]
-                if duration >= 10: 
-                    print("Processing clip" + str(index) + " from " +
-                        str(moment["start"]) + " to " + str(moment["end"]))
-                    process_clip(base_dir, video_path, s3_key, moment["start"], moment["end"], index, transcript_segments)  
+            # 3. Process Clips
+            processed_clips = []
+            for index, moment in enumerate(clip_moments[:clip_count]):
+                if "start" in moment and "end" in moment:
+                    duration = moment["end"] - moment["start"]
+                    if duration >= 10: 
+                        print(f"Processing clip {index} from {moment['start']} to {moment['end']} ({duration:.1f}s)")
+                        
+                        # Generate output S3 key for this clip
+                        clip_s3_key = f"{output_s3_prefix}/clip_{index}.mp4"
+                        
+                        try:
+                            process_clip(base_dir, video_path, clip_s3_key, moment["start"], moment["end"], index, transcript_segments)
+                            processed_clips.append({
+                                "clip_index": index,
+                                "start_time": moment["start"],
+                                "end_time": moment["end"],
+                                "duration": duration,
+                                "s3_key": clip_s3_key,
+                                "status": "success"
+                            })
+                        except Exception as e:
+                            print(f"Error processing clip {index}: {str(e)}")
+                            processed_clips.append({
+                                "clip_index": index,
+                                "start_time": moment["start"],
+                                "end_time": moment["end"],
+                                "duration": duration,
+                                "s3_key": clip_s3_key,
+                                "status": "error",
+                                "error": str(e)
+                            })
+                    else:
+                        print(f"Skipping clip {index}: too short ({duration:.1f}s)")
 
-        if base_dir.exists():
-            print(f"Cleaning up temp dir after {base_dir}")
-            shutil.rmtree(base_dir, ignore_errors=True)      
+            # Prepare response
+            response_data = {
+                "run_id": run_id,
+                "video_source": video_source,
+                "processed_clips": processed_clips,
+                "total_clips_processed": len([c for c in processed_clips if c["status"] == "success"]),
+                "total_clips_requested": clip_count
+            }
+            
+            # Add source-specific metadata
+            if video_source == "youtube":
+                response_data["video_info"] = {
+                    "title": video_info.get("title"),
+                    "duration": video_info.get("duration"),
+                    "uploader": video_info.get("uploader"),
+                    "upload_date": video_info.get("upload_date"),
+                    "view_count": video_info.get("view_count")
+                }
+            elif video_source == "s3":
+                response_data["s3_key"] = s3_key
+
+            return response_data
+
+        except Exception as e:
+            print(f"Error in process_video: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Error processing video: {str(e)}"
+            )
+        finally:
+            # Clean up temporary files
+            if base_dir.exists():
+                print(f"Cleaning up temp dir: {base_dir}")
+                shutil.rmtree(base_dir, ignore_errors=True)
 
 @app.local_entrypoint()
 def main():
     import requests
 
     ai_podcast_clipper = AiPodcastClipper()
-
     url = ai_podcast_clipper.process_video.web_url
 
-    payload = {
+    # Example 1: Process from S3 (original functionality)
+    print("=== Example 1: Processing from S3 ===")
+    s3_payload = {
         "s3_key": "3zhHBEDMtMIEiRshOHkFSV72wKfdKkKI/3da8790a-195b-4314-b940-bb5d8819f462/original.mp4",
         "clip_count": 1
     }
+    
+    # Example 2: Process from YouTube URL
+    print("=== Example 2: Processing from YouTube ===")
+    youtube_payload = {
+        "youtube_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",  # Replace with actual podcast URL
+        "clip_count": 2
+    }
+    
     headers = {
         "Content-Type": "application/json",
         "Authorization": "Bearer 123123"
     }
 
-    response = requests.post(url, json=payload,
-                             headers=headers)
-    response.raise_for_status()
-    result = response.json()
-    print(result)
+    # Choose which example to run (comment/uncomment as needed)
+    payload = youtube_payload  # Change to s3_payload to test S3 functionality
+    
+    print(f"Sending request to: {url}")
+    print(f"Payload: {payload}")
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=900)
+        response.raise_for_status()
+        result = response.json()
+        
+        print("=== Processing completed successfully ===")
+        print(f"Run ID: {result.get('run_id')}")
+        print(f"Video Source: {result.get('video_source')}")
+        print(f"Clips processed: {result.get('total_clips_processed')}/{result.get('total_clips_requested')}")
+        
+        if result.get('video_source') == 'youtube':
+            video_info = result.get('video_info', {})
+            print(f"Video Title: {video_info.get('title')}")
+            print(f"Duration: {video_info.get('duration')}s")
+            print(f"Uploader: {video_info.get('uploader')}")
+        
+        print("\n=== Processed Clips ===")
+        for clip in result.get('processed_clips', []):
+            if clip['status'] == 'success':
+                print(f"✓ Clip {clip['clip_index']}: {clip['start_time']:.1f}s - {clip['end_time']:.1f}s ({clip['duration']:.1f}s)")
+                print(f"  S3 Key: {clip['s3_key']}")
+            else:
+                print(f"✗ Clip {clip['clip_index']}: Failed - {clip.get('error', 'Unknown error')}")
+                
+    except requests.exceptions.HTTPError as e:
+        print(f"HTTP Error: {e}")
+        if e.response.content:
+            print(f"Error details: {e.response.text}")
+    except requests.exceptions.RequestException as e:
+        print(f"Request Error: {e}")
+    except Exception as e:
+        print(f"Unexpected Error: {e}")

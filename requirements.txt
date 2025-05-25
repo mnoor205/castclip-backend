@@ -19,3 +19,4 @@ boto3
 fastapi[standard]
 whisperx
 hf_xet
+yt-dlp
