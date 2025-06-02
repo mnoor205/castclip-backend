@@ -5,6 +5,10 @@ __pycache__/
 .venv/
 env/
 LR-ASD/
+basicsr/
+example_usage.py
+test.py
+clips/
 
 .DS_STORE
 Thumbs.db
