@@ -22,7 +22,6 @@ import pysubs2
 from google.genai import types
 from yt_dlp import YoutubeDL
 import httpx
-import concurrent.futures
 
 
 class ProcessVideoRequest(BaseModel):
@@ -428,26 +427,9 @@ def create_optimized_ffmpeg_command_production(emoji_overlays, clip_video_path, 
     return f'ffmpeg -y {" ".join(inputs)} -filter_complex "{filter_chain}" -map "[final]" -map 0:a? -c:v h264 -preset fast -crf 23 "{output_path}"'
 
 
-def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip_video_path, output_path, 
+def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip_video_path, output_path, hook, 
                                 style=1, emoji_config_path="/emoji_config.json", 
                                 emoji_filenames_path="/emoji_filenames.json"):
-    """
-    Create subtitles with optional emoji overlays using FFmpeg
-    
-    Args:
-        transcript_segments: List of transcript segments with word timing
-        clip_start: Start time of the clip in seconds
-        clip_end: End time of the clip in seconds (None for full video)
-        clip_video_path: Input video file path
-        output_path: Output video file path
-        style: Subtitle style (1-4, currently 1 and 2 implemented)
-        emoji_config_path: Path to emoji configuration JSON
-        emoji_filenames_path: Path to emoji filenames JSON
-    
-    Raises:
-        ValueError: If style is not between 1 and 4
-        FileNotFoundError: If required video file doesn't exist
-    """
     
     if style not in [1, 2, 3, 4]:
         raise ValueError("Style must be between 1 and 4")
@@ -529,6 +511,35 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
         raise NotImplementedError("Style 4 not implemented yet")
     
     subs.styles[style_name] = new_style
+
+    # Add hook style
+    if hook:
+        hook_style = pysubs2.SSAStyle()
+        hook_style.fontname = "Impact"
+        hook_style.fontsize = 100
+        hook_style.primarycolor = pysubs2.Color(255, 255, 255)  # White text
+        hook_style.outline = 3.0
+        hook_style.outlinecolor = pysubs2.Color(0, 0, 0)  # Black outline
+        hook_style.shadow = 2.0
+        hook_style.shadowcolor = pysubs2.Color(0, 0, 0, 180)  # Dark shadow
+        hook_style.alignment = 8  # Center-top alignment (not center-bottom)
+        hook_style.marginl = 60
+        hook_style.marginr = 60
+        hook_style.marginv = 250  # Distance from top edge
+        hook_style.bold = True
+        hook_style.spacing = 1.0
+        
+        subs.styles["Hook"] = hook_style
+        
+        # Add title event that spans the entire video
+        hook_text = hook.upper()
+
+        subs.events.append(pysubs2.SSAEvent(
+            start=pysubs2.make_time(s=0),
+            end=pysubs2.make_time(s=clip_end - clip_start if clip_end else 30),
+            text=hook_text,
+            style="Hook"
+        ))
 
     if style == 3:
         group_size = 3 
@@ -681,11 +692,12 @@ def get_emoji_manager(emoji_config_path="/emoji_config.json", emoji_filenames_pa
     return _global_emoji_manager
 
 
-def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_time: float, end_time: float, clip_index: int, transcript_segments: list, style: int = 1):
+def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_time: float, end_time: float, clip_index: int, transcript_segments: list, hook: str, style: int = 1):
     clip_name = f"clip_{clip_index}"
     s3_key_dir = os.path.dirname(s3_key)
     output_s3_key = f"{s3_key_dir}/{clip_name}.mp4"
     print(f"Output S3 key: {output_s3_key}")
+    print(f"Processing clip {clip_index} with hook: '{hook}' and style: {style}")
 
     clip_dir = base_dir / clip_name
     clip_dir.mkdir(parents=True, exist_ok=True)
@@ -744,7 +756,7 @@ def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_tim
         f"Clip {clip_index} vertical video creation time: {cvv_end_time - cvv_start_time:.2f} seconds")
 
     create_subtitles_with_ffmpeg(
-        transcript_segments, start_time, end_time, vertical_mp4_path, subtitle_output_path, style=style)
+        transcript_segments, start_time, end_time, vertical_mp4_path, subtitle_output_path, hook, style=style)
 
     # Final TikTok-friendly normalization
     final_output_path = clip_dir / "pyavi" / "final_output.mp4"
@@ -780,21 +792,73 @@ def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_tim
     )
     
 
-def generate_clip_threadsafe(args):
+@app.function(gpu="L40S", timeout=600, secrets=[modal.Secret.from_name("ai-podcast-clipper-secret")])
+def process_single_clip(clip_args: dict):
+    """
+    Process a single clip using Modal's built-in parallelism
+    Each clip runs in its own container for true parallelism
+    """
     try:
+        # Create a temporary directory for this clip
+        run_id = str(uuid.uuid4())
+        base_dir = pathlib.Path("/tmp") / run_id
+        base_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Extract hook and log it
+        hook = clip_args.get("hook", "")
+        clip_index = clip_args.get("index", -1)
+        print(f"Processing clip {clip_index} with hook: '{hook}'")
+        
+        # Download the original video for this clip processing
+        video_path = base_dir / "input.mp4"
+        
+        if clip_args["s3_key"].startswith("http://") or clip_args["s3_key"].startswith("https://"):
+            # Handle YouTube URL (though this should be rare in clip processing)
+            ydl_opts = {
+                'format': 'bestvideo+bestaudio/best',
+                'outtmpl': str(video_path),
+                'merge_output_format': 'mp4',
+                'quiet': True,
+                'noplaylist': True,
+                'nocheckcertificate': True,
+                'retries': 3,
+            }
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(clip_args["s3_key"], download=True)
+        else:
+            # Download from S3
+            s3_client = boto3.client(
+                "s3",
+                aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+                aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+                endpoint_url=os.environ["R2_ENDPOINT_URL"],
+                region_name="auto"
+            )
+            s3_client.download_file(
+                "ai-podcast-clipper", clip_args["s3_key"], str(video_path))
+        
+        # Process the clip
         process_clip(
-            base_dir=args["base_dir"],
-            original_video_path=args["video_path"],
-            s3_key=args["s3_key"],
-            start_time=args["start"],
-            end_time=args["end"],
-            clip_index=args["index"],
-            transcript_segments=args["transcript_segments"],
-            style=args["style"]
+            base_dir=base_dir,
+            original_video_path=str(video_path),
+            s3_key=clip_args["s3_key"],
+            start_time=clip_args["start"],
+            end_time=clip_args["end"],
+            clip_index=clip_args["index"],
+            transcript_segments=clip_args["transcript_segments"],
+            hook=hook,  # Pass the extracted hook
+            style=clip_args["style"]
         )
-        return {"index": args["index"], "status": "success"}
+        
+        # Cleanup
+        if base_dir.exists():
+            shutil.rmtree(base_dir, ignore_errors=True)
+        
+        return {"index": clip_args["index"], "status": "success"}
+        
     except Exception as e:
-        return {"index": args["index"], "status": "error", "error": str(e)}
+        print(f"Error processing clip {clip_args.get('index', 'unknown')}: {e}")
+        return {"index": clip_args.get("index", -1), "status": "error", "error": str(e)}
 
 
 @app.cls(gpu="L40S", timeout=900, retries=0, scaledown_window=20, secrets=[modal.Secret.from_name("ai-podcast-clipper-secret")], volumes={mount_path: volume})
@@ -963,7 +1027,7 @@ class AiPodcastClipper:
                             types.SafetySetting(
                                 category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
                         ],
-                            system_instruction="You are a Podcast Clip Extractor, tasked with creating  clips for short-form platforms like TikTok and YouTube Shorts. Your goal is to identify and extract engaging stories, questions, and answers from podcast transcripts that will appeal to up-and-coming entrepreneurs seeking advice and motivation."),
+                            system_instruction="You are a Podcast Clip Extractor, tasked with creating clips for short-form platforms like TikTok and YouTube Shorts. Your goal is to identify and extract engaging stories, questions, and answers from podcast transcripts that will appeal to up-and-coming entrepreneurs seeking advice and motivation."),
                         contents=[
                             types.Content(
                                 role="user",
@@ -1065,20 +1129,34 @@ class AiPodcastClipper:
                 if "start" in moment and "end" in moment:
                     duration = moment["end"] - moment["start"]
                     if duration >= 10:
+                        hook = moment.get("hook", "")
+                        print(f"Clip {index}: Hook = '{hook}', Duration = {duration:.1f}s")
                         clip_args_list.append({
-                            "base_dir": base_dir,
-                            "video_path": video_path,
                             "s3_key": s3_key,
                             "start": moment["start"],
                             "end": moment["end"],
                             "index": index,
                             "transcript_segments": transcript_segments,
+                            "hook": hook,  # Include hook from moment
                             "style": request.style
                         })
             
-            # Run clips in parallel using threads
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                list(executor.map(generate_clip_threadsafe, clip_args_list))
+            # Use Modal's built-in parallelism
+            print(f"Processing {len(clip_args_list)} clips using Modal's parallel processing...")
+            if clip_args_list:
+                results = list(process_single_clip.map(clip_args_list))
+                
+                # Log results
+                successful_clips = [r for r in results if r["status"] == "success"]
+                failed_clips = [r for r in results if r["status"] == "error"]
+                
+                print(f"Clip processing complete: {len(successful_clips)} successful, {len(failed_clips)} failed")
+                
+                if failed_clips:
+                    for failed_clip in failed_clips:
+                        print(f"Failed clip {failed_clip['index']}: {failed_clip.get('error', 'Unknown error')}")
+            else:
+                print("No valid clips to process")
 
         except Exception as e:
             print(f"Unhandled error during process_video: {e}")
@@ -1099,9 +1177,9 @@ def main():
     url = ai_podcast_clipper.process_video.web_url
 
     payload = {
-        "s3_key": "3zhHBEDMtMIEiRshOHkFSV72wKfdKkKI/162e8d57-008e-47ec-b3b1-6f8614aabf85/video.mp4",
-        "clip_count": 3,
-        "style": 3
+        "s3_key": "3zhHBEDMtMIEiRshOHkFSV72wKfdKkKI/55b7bc53-3fe1-44c4-9996-3764e4cfa04e/original.mp4",
+        "clip_count": 2 ,
+        "style": 1
     }
     headers = {
         "Content-Type": "application/json",

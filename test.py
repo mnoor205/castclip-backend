@@ -6,23 +6,14 @@ import pysubs2
 import re
 
 # Paste or import your transcript_segments here
-transcript_segments = [
-  {"start": 0.031, "end": 0.191, "word": "Tables"},
-  {"start": 0.211, "end": 0.371, "word": "turn,"},
-  {"start": 0.391, "end": 0.531, "word": "bridges"},
-  {"start": 0.551, "end": 0.671, "word": "burn,"},
-  {"start": 0.691, "end": 0.831, "word": "you"},
-  {"start": 0.851, "end": 0.971, "word": "live"},
-  {"start": 0.991, "end": 1.111, "word": "and"},
-  {"start": 1.131, "end": 1.271, "word": "you"},
-  {"start": 1.291, "end": 1.431, "word": "learn"}
-]
+transcript_segments = [{'start': 0.031, 'end': 0.292, 'word': 'Sun'}, {'start': 0.332, 'end': 0.472, 'word': "don't"}, {'start': 0.492, 'end': 0.672, 'word': 'stop'}, {'start': 0.712, 'end': 0.772, 'word': 'for'}, {'start': 0.813, 'end': 1.073, 'word': 'nobody,'}, {'start': 1.093, 'end': 1.253, 'word': 'man.'}, {'start': 2.656, 'end': 2.796, 'word': 'Sun'}, {'start': 2.816, 'end': 2.957, 'word': "don't"}, {'start': 2.977, 'end': 3.197, 'word': 'fucking'}, {'start': 3.217, 'end': 3.458, 'word': 'stop.'}, {'start': 3.518, 'end': 3.678, 'word': 'Sun'}, {'start': 3.698, 'end': 3.838, 'word': 'gonna'}, {'start': 3.878, 'end': 3.959, 'word': 'be'}, {'start': 4.019, 'end': 4.059, 'word': 'up'}, {'start': 4.099, 'end': 4.139, 'word': 'in'}, {'start': 4.159, 'end': 4.219, 'word': 'the'}, {'start': 4.259, 'end': 4.46, 'word': 'morning'}, {'start': 4.5, 'end': 4.94, 'word': 'regardless.'}, {'start': 6.043, 'end': 6.183, 'word': 'That'}, {'start': 6.223, 'end': 6.483, 'word': 'sun'}, {'start': 6.604, 'end': 6.664, 'word': 'is'}, {'start': 6.684, 'end': 6.884, 'word': 'gonna'}, {'start': 6.964, 'end': 7.245, 'word': 'be'}, {'start': 7.706, 'end': 7.826, 'word': 'up'}, {'start': 8.407, 'end': 8.467, 'word': 'in'}, {'start': 8.507, 'end': 8.567, 'word': 'the'}, {'start': 8.587, 'end': 8.808, 'word': 'morning'}, {'start': 8.828, 'end': 9.149, 'word': 'regardless.'}, {'start': 9.169, 'end': 9.409, 'word': 'Regardless'}, {'start': 9.429, 'end': 9.509, 'word': 'of'}, {'start': 9.549, 'end': 9.71, 'word': 'how'}, {'start': 9.79, 'end': 9.89, 'word': 'I'}, {'start': 9.93, 'end': 10.271, 'word': 'fucking'}, {'start': 10.331, 'end': 10.611, 'word': 'feel'}, {'start': 10.651, 'end': 11.493, 'word': 'and'}, {'start': 11.533, 'end': 11.653, 'word': 'how'}, {'start': 11.713, 'end': 12.074, 'word': 'depressed'}, {'start': 12.174, 'end': 12.234, 'word': 'I'}, {'start': 12.335, 'end': 12.435, 'word': 'am,'}, {'start': 12.475, 'end': 12.615, 'word': 'the'}, {'start': 12.775, 'end': 13.096, 'word': 'sun'}, {'start': 13.136, 'end': 13.938, 'word': 'is'}, {'start': 13.978, 'end': 14.178, 'word': 'gonna'}, {'start': 14.198, 'end': 14.539, 'word': 'fucking'}, {'start': 14.579, 'end': 14.859, 'word': 'shine'}, {'start': 14.88, 'end': 14.92, 'word': 'in'}, {'start': 14.96, 'end': 15.02, 'word': 'the'}, {'start': 15.06, 'end': 15.36, 'word': 'morning'}, {
+    'start': 16.402, 'end': 16.483, 'word': 'and'}, {'start': 16.523, 'end': 16.563, 'word': 'at'}, {'start': 16.623, 'end': 17.004, 'word': 'nighttime'}, {'start': 17.064, 'end': 17.124, 'word': 'the'}, {'start': 17.184, 'end': 17.384, 'word': 'moon'}, {'start': 17.404, 'end': 17.585, 'word': 'gonna'}, {'start': 17.625, 'end': 17.725, 'word': 'be'}, {'start': 17.765, 'end': 17.885, 'word': 'there'}, {'start': 17.905, 'end': 17.965, 'word': 'and'}, {'start': 18.006, 'end': 18.066, 'word': 'you'}, {'start': 18.126, 'end': 18.226, 'word': 'gonna'}, {'start': 18.246, 'end': 18.386, 'word': 'look'}, {'start': 18.446, 'end': 18.527, 'word': 'up,'}, {'start': 18.567, 'end': 18.687, 'word': 'these'}, {'start': 18.747, 'end': 18.987, 'word': 'days'}, {'start': 19.027, 'end': 19.168, 'word': 'gonna'}, {'start': 19.208, 'end': 19.348, 'word': 'keep'}, {'start': 19.388, 'end': 19.589, 'word': 'going'}, {'start': 19.609, 'end': 19.789, 'word': 'by.'}, {'start': 21.452, 'end': 21.552, 'word': 'So'}, {'start': 21.572, 'end': 21.632, 'word': 'do'}, {'start': 21.673, 'end': 21.753, 'word': 'you'}, {'start': 21.793, 'end': 21.893, 'word': 'let'}, {'start': 21.933, 'end': 21.993, 'word': 'the'}, {'start': 22.033, 'end': 22.234, 'word': 'days'}, {'start': 22.294, 'end': 22.414, 'word': 'go'}, {'start': 22.474, 'end': 22.634, 'word': 'by'}, {'start': 22.674, 'end': 22.735, 'word': 'and'}, {'start': 22.775, 'end': 22.915, 'word': 'look'}, {'start': 22.975, 'end': 23.035, 'word': 'up'}, {'start': 23.095, 'end': 23.155, 'word': 'and'}, {'start': 23.175, 'end': 23.236, 'word': 'you'}, {'start': 23.256, 'end': 23.376, 'word': 'done'}, {'start': 23.396, 'end': 23.656, 'word': 'wasted'}, {'start': 23.696, 'end': 23.716, 'word': 'a'}, {'start': 23.757, 'end': 23.917, 'word': 'year'}, {'start': 24.037, 'end': 24.278, 'word': 'doing'}, {'start': 24.378, 'end': 24.598, 'word': 'what?'}, {'start': 25.8, 'end': 25.861, 'word': 'Or'}, {'start': 25.881, 'end': 25.921, 'word': 'do'}, {'start': 25.941, 'end': 26.001, 'word': 'you'}, {'start': 26.021, 'end': 26.141, 'word': 'just'}, {'start': 26.201, 'end': 26.342, 'word': 'pick'}, {'start': 26.382, 'end': 26.422, 'word': 'it'}, {'start': 26.522, 'end': 26.602, 'word': 'up?'}, {'start': 27.965, 'end': 28.025, 'word': 'All'}, {'start': 28.045, 'end': 28.165, 'word': 'right.'}]
 
 
 # Set the start and end time for the subtitles (full video by default)
 clip_start = 0.0
 clip_end = None  # Will be set to video duration if None
-clip_video_path = "clips/clippa.MP4"
+clip_video_path = "clips/clip.mp4"
 output_path = "clip_with_subs.mp4"
 
 class ProductionEmojiManager:
@@ -333,7 +324,7 @@ def create_optimized_ffmpeg_command_production(emoji_overlays, clip_video_path, 
     print(f"Generated FFmpeg command:\n{final_command}")
     return final_command
 
-def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip_video_path, output_path, style=1):
+def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip_video_path, output_path, style=1, title=None):
     if style not in [1, 2, 3, 4]:
         raise ValueError("Style must be between 1 and 4")
     
@@ -407,6 +398,35 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
         return
     
     subs.styles[style_name] = new_style
+
+    # Add title style if title is provided
+    if title:
+        title_style = pysubs2.SSAStyle()
+        title_style.fontname = "Impact"
+        title_style.fontsize = 93
+        title_style.primarycolor = pysubs2.Color(255, 255, 255)  # White text
+        title_style.outline = 3.0
+        title_style.outlinecolor = pysubs2.Color(0, 0, 0)  # Black outline
+        title_style.shadow = 2.0
+        title_style.shadowcolor = pysubs2.Color(0, 0, 0, 180)  # Dark shadow
+        title_style.alignment = 8  # Center-top alignment (not center-bottom)
+        title_style.marginl = 60
+        title_style.marginr = 60
+        title_style.marginv = 250  # Distance from top edge
+        title_style.bold = True
+        title_style.spacing = 1.0
+        
+        subs.styles["Title"] = title_style
+        
+        # Add title event that spans the entire video
+        title_text = title.upper()
+
+        subs.events.append(pysubs2.SSAEvent(
+            start=pysubs2.make_time(s=0),
+            end=pysubs2.make_time(s=clip_end - clip_start if clip_end else 30),
+            text=title_text,
+            style="Title"
+        ))
 
     if style == 3:
         group_size = 3 
@@ -554,5 +574,13 @@ if __name__ == "__main__":
         # Style 3: Karaoke style with word-by-word sweeping highlight effects
         # Style 4: Not implemented yet
         
-        # Test karaoke style
-        create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip_video_path, "clip_with_subs_style_2.mp4", style=2)
+        # Test with title - similar to the style shown in the image
+        create_subtitles_with_ffmpeg(
+            transcript_segments, 
+            clip_start, 
+            clip_end, 
+            clip_video_path, 
+            "clip_with_subs_style_1.mp4", 
+            style=1, 
+            title="Josh Allen made a core memory for this fan"
+        )
