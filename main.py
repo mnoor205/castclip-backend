@@ -22,6 +22,7 @@ import pysubs2
 from google.genai import types
 from yt_dlp import YoutubeDL
 import httpx
+import concurrent.futures
 
 
 class ProcessVideoRequest(BaseModel):
@@ -792,76 +793,31 @@ def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_tim
     )
     
 
-@app.function(gpu="L40S", timeout=600, secrets=[modal.Secret.from_name("ai-podcast-clipper-secret")])
-def process_single_clip(clip_args: dict):
+def generate_clip_threadsafe(args):
     """
-    Process a single clip using Modal's built-in parallelism
-    Each clip runs in its own container for true parallelism
+    Thread-safe wrapper for process_clip with proper error handling
+    Optimized for cost-effective parallel processing
     """
     try:
-        # Create a temporary directory for this clip
-        run_id = str(uuid.uuid4())
-        base_dir = pathlib.Path("/tmp") / run_id
-        base_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Extract hook and log it
-        hook = clip_args.get("hook", "")
-        clip_index = clip_args.get("index", -1)
-        print(f"Processing clip {clip_index} with hook: '{hook}'")
-        
-        # Download the original video for this clip processing
-        video_path = base_dir / "input.mp4"
-        
-        if clip_args["s3_key"].startswith("http://") or clip_args["s3_key"].startswith("https://"):
-            # Handle YouTube URL (though this should be rare in clip processing)
-            ydl_opts = {
-                'format': 'bestvideo+bestaudio/best',
-                'outtmpl': str(video_path),
-                'merge_output_format': 'mp4',
-                'quiet': True,
-                'noplaylist': True,
-                'nocheckcertificate': True,
-                'retries': 3,
-            }
-            with YoutubeDL(ydl_opts) as ydl:
-                ydl.extract_info(clip_args["s3_key"], download=True)
-        else:
-            # Download from S3
-            s3_client = boto3.client(
-                "s3",
-                aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-                aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-                endpoint_url=os.environ["R2_ENDPOINT_URL"],
-                region_name="auto"
-            )
-            s3_client.download_file(
-                "ai-podcast-clipper", clip_args["s3_key"], str(video_path))
-        
-        # Process the clip
         process_clip(
-            base_dir=base_dir,
-            original_video_path=str(video_path),
-            s3_key=clip_args["s3_key"],
-            start_time=clip_args["start"],
-            end_time=clip_args["end"],
-            clip_index=clip_args["index"],
-            transcript_segments=clip_args["transcript_segments"],
-            hook=hook,  # Pass the extracted hook
-            style=clip_args["style"]
+            base_dir=args["base_dir"],
+            original_video_path=args["video_path"],
+            s3_key=args["s3_key"],
+            start_time=args["start"],
+            end_time=args["end"],
+            clip_index=args["index"],
+            transcript_segments=args["transcript_segments"],
+            hook=args["hook"],
+            style=args["style"]
         )
-        
-        # Cleanup
-        if base_dir.exists():
-            shutil.rmtree(base_dir, ignore_errors=True)
-        
-        return {"index": clip_args["index"], "status": "success"}
-        
+        print(f"✅ Clip {args['index']} completed successfully")
+        return {"index": args["index"], "status": "success"}
     except Exception as e:
-        print(f"Error processing clip {clip_args.get('index', 'unknown')}: {e}")
-        return {"index": clip_args.get("index", -1), "status": "error", "error": str(e)}
+        print(f"❌ Clip {args['index']} failed: {str(e)}")
+        return {"index": args["index"], "status": "error", "error": str(e)}
 
 
-@app.cls(gpu="L40S", timeout=900, retries=0, scaledown_window=20, secrets=[modal.Secret.from_name("ai-podcast-clipper-secret")], volumes={mount_path: volume})
+@app.cls(gpu="L40S", timeout=1800, retries=0, scaledown_window=20, secrets=[modal.Secret.from_name("ai-podcast-clipper-secret")], volumes={mount_path: volume})
 class AiPodcastClipper:
     @modal.enter()
     def load_modal(self):
@@ -1122,9 +1078,8 @@ class AiPodcastClipper:
 
             clip_moments = all_moments
 
-
+            # 3. Process Clips using optimized threading
             clip_args_list = []
-            # 3. Process Clips
             for index, moment in enumerate(clip_moments[:clip_count]):
                 if "start" in moment and "end" in moment:
                     duration = moment["end"] - moment["start"]
@@ -1132,29 +1087,34 @@ class AiPodcastClipper:
                         hook = moment.get("hook", "")
                         print(f"Clip {index}: Hook = '{hook}', Duration = {duration:.1f}s")
                         clip_args_list.append({
+                            "base_dir": base_dir,
+                            "video_path": str(video_path),
                             "s3_key": s3_key,
                             "start": moment["start"],
                             "end": moment["end"],
                             "index": index,
                             "transcript_segments": transcript_segments,
-                            "hook": hook,  # Include hook from moment
+                            "hook": hook,
                             "style": request.style
                         })
             
-            # Use Modal's built-in parallelism
-            print(f"Processing {len(clip_args_list)} clips using Modal's parallel processing...")
+            # Optimized threading with dynamic worker count
+            max_workers = min(len(clip_args_list), 6)  # Limit to 6 workers for cost efficiency
+            print(f"Processing {len(clip_args_list)} clips using {max_workers} threads...")
+            
             if clip_args_list:
-                results = list(process_single_clip.map(clip_args_list))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    results = list(executor.map(generate_clip_threadsafe, clip_args_list))
                 
                 # Log results
                 successful_clips = [r for r in results if r["status"] == "success"]
                 failed_clips = [r for r in results if r["status"] == "error"]
                 
-                print(f"Clip processing complete: {len(successful_clips)} successful, {len(failed_clips)} failed")
+                print(f"🎉 Processing complete: {len(successful_clips)} successful, {len(failed_clips)} failed")
                 
                 if failed_clips:
                     for failed_clip in failed_clips:
-                        print(f"Failed clip {failed_clip['index']}: {failed_clip.get('error', 'Unknown error')}")
+                        print(f"❌ Failed clip {failed_clip['index']}: {failed_clip.get('error', 'Unknown error')}")
             else:
                 print("No valid clips to process")
 
@@ -1178,7 +1138,7 @@ def main():
 
     payload = {
         "s3_key": "3zhHBEDMtMIEiRshOHkFSV72wKfdKkKI/55b7bc53-3fe1-44c4-9996-3764e4cfa04e/original.mp4",
-        "clip_count": 2 ,
+        "clip_count": 10,  # Reasonable test count
         "style": 1
     }
     headers = {
