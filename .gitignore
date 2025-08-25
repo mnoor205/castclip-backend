@@ -9,8 +9,11 @@ basicsr/
 example_usage.py
 test.py
 clips/
+outputs/
 
 .DS_STORE
 Thumbs.db
 
 *.mp4
+
+cookies.txt

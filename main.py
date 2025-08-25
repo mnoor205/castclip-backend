@@ -1,5 +1,5 @@
 import modal
-from fastapi import Depends, status, HTTPException
+from fastapi import Depends, status, HTTPException, BackgroundTasks
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 import os
@@ -23,12 +23,109 @@ from google.genai import types
 from yt_dlp import YoutubeDL
 import httpx
 import concurrent.futures
+import requests
+import logging
+from typing import Optional
+from fastapi.responses import JSONResponse
+
+
+def send_completion_webhook(webhook_url: str, user_id: str, project_id: str, status: str = "completed", error_message: Optional[str] = None) -> bool:
+    """
+    Sends a secure POST request to the provided webhook URL to notify
+    that video processing is complete or failed.
+
+    Args:
+        webhook_url: The callback URL provided by the Next.js app
+        user_id: The ID of the user
+        project_id: The ID of the project that was processed
+        status: Processing status ('completed', 'failed', 'error')
+        error_message: Optional error message if status is 'failed' or 'error'
+    
+    Returns:
+        bool: True if webhook was sent successfully, False otherwise
+    """
+    if not webhook_url or not webhook_url.strip():
+        logging.warning("Webhook URL not provided, skipping notification")
+        return False
+
+    print(f"Webhook URL: {webhook_url}")
+    
+    secret_token = os.getenv("WEBHOOK_SECRET")
+    if not secret_token:
+        logging.critical("WEBHOOK_SECRET environment variable not set")
+        return False
+
+    # Parse user_id and project_id from ids if needed
+    if "/" in user_id:
+        user_id, project_id = user_id.split("/", 1)
+
+    # Construct payload with comprehensive information
+    payload = {
+        "user_id": user_id,
+        "project_id": project_id,
+        "status": status,
+        "timestamp": int(time.time()),
+        "processing_completed_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    }
+    
+    # Add error information if applicable
+    if error_message and status in ["failed", "error"]:
+        payload["error"] = {
+            "message": error_message,
+            "type": "processing_error"
+        }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {secret_token}",
+        "User-Agent": "AI-Podcast-Clipper/1.0",
+        "X-Webhook-Source": "modal-backend"
+    }
+
+    logging.info(f"Sending {status} webhook for project {project_id} to {webhook_url}")
+
+    try:
+        # Use a reasonable timeout and retry configuration
+        response = requests.post(
+            webhook_url, 
+            json=payload, 
+            headers=headers, 
+            timeout=30,
+            allow_redirects=False  # Don't follow redirects for security
+        )
+
+        # Log response details for debugging
+        logging.info(f"Webhook response: {response.status_code} for project {project_id}")
+        
+        # Check for successful response (2xx status codes)
+        if 200 <= response.status_code < 300:
+            logging.info(f"Successfully sent {status} webhook for project {project_id}")
+            return True
+        else:
+            logging.error(f"Webhook failed with status {response.status_code} for project {project_id}")
+            logging.error(f"Response body: {response.text[:500]}")  # Log first 500 chars
+            return False
+
+    except requests.exceptions.Timeout:
+        logging.error(f"Webhook timeout for project {project_id} after 30 seconds")
+        return False
+    except requests.exceptions.ConnectionError:
+        logging.error(f"Connection error sending webhook for project {project_id}")
+        return False
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to send webhook for project {project_id}: {type(e).__name__}: {str(e)}")
+        return False
+    except Exception as e:
+        logging.error(f"Unexpected error sending webhook for project {project_id}: {type(e).__name__}: {str(e)}")
+        return False
 
 
 class ProcessVideoRequest(BaseModel):
     s3_key: str
+    ids: str          # userid/projectid
     clip_count: int = 1
     style: int = 1
+    webhook_url: str  # Optional webhook URL for completion notifications
 
 
 image = (modal.Image.from_registry(
@@ -41,7 +138,8 @@ image = (modal.Image.from_registry(
                    "fc-cache -f -v"])
     .add_local_dir("LR-ASD", "/LR-ASD", copy=True)
     .add_local_file("emoji_config.json", "/emoji_config.json")
-    .add_local_file("emoji_filenames.json", "/emoji_filenames.json"))
+    .add_local_file("emoji_filenames.json", "/emoji_filenames.json")
+    .add_local_file("cookies.txt", "/cookies.txt"))
 
 app = modal.App("ai-podcast-clipper", image=image)
 
@@ -836,6 +934,175 @@ class AiPodcastClipper:
         self.gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
         print("Generated Gemini Client")
 
+    def _process_video_job(self, request_dict: dict, run_id: str):
+        """
+        Long-running processing job executed in the background.
+        Keeps existing webhook semantics for success/failure notifications.
+        """
+        # Re-hydrate request model (ensures validation) without coupling to FastAPI context
+        request = ProcessVideoRequest(**request_dict)
+        try:
+            s3_key = request.s3_key
+            clip_count = request.clip_count
+
+            base_dir = pathlib.Path("/tmp") / run_id
+            base_dir.mkdir(parents=True, exist_ok=True)
+
+            # Download Video
+            video_path = base_dir / "input.mp4"
+
+            if request.s3_key.startswith("http://") or request.s3_key.startswith("https://"):
+                print("Detected YouTube URL, starting download...")
+                try:
+                    self.download_youtube_video(request.s3_key, video_path)
+                    ids = request.ids
+                    s3_key = f"{ids}/input.mp4"
+                except HTTPException:
+                    # Re-raise the specific YouTube error
+                    raise
+                except Exception as e:
+                    # Catch any other unexpected errors
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error_type": "youtube_download_failed",
+                            "message": "Unexpected error during YouTube download",
+                            "original_error": str(e)
+                        }
+                    )
+            else:
+                print("Downloading video from S3...")
+                s3_client = boto3.client(
+                    "s3",
+                    aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+                    aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+                    endpoint_url=os.environ["R2_ENDPOINT_URL"],
+                    region_name="auto"
+                )
+                s3_client.download_file(
+                    "ai-podcast-clipper", s3_key, str(video_path))
+
+            # 1. Transcription
+            transcript_segments_json = self.transcribe_video(
+                base_dir, video_path)
+            
+            transcript_segments = json.loads(transcript_segments_json)
+
+            # 2. Identify moments for clips
+            print("Identifying clip moments")
+            identified_moments_raw = self.identify_moments(
+                transcript_segments, clip_count)
+
+            all_moments = []
+            for chunk_str in identified_moments_raw:
+                cleaned = chunk_str.strip()
+                if cleaned.startswith("```json"):
+                    cleaned = cleaned[len("```json"):].strip()
+                if cleaned.endswith("```"):
+                    cleaned = cleaned[:-len("```")].strip()
+
+                try:
+                    parsed = json.loads(cleaned)
+                    if isinstance(parsed, list):
+                        all_moments.extend(parsed)
+                    else:
+                        print("Warning: Parsed chunk is not a list, skipping")
+                except json.JSONDecodeError as e:
+                    print(f"Error parsing JSON chunk: {e}")
+                    continue
+
+            clip_moments = all_moments
+
+            # 3. Process Clips using optimized threading
+            clip_args_list = []
+            for index, moment in enumerate(clip_moments[:clip_count]):
+                if "start" in moment and "end" in moment:
+                    duration = moment["end"] - moment["start"]
+                    if duration >= 10:
+                        hook = moment.get("hook", "")
+                        print(f"Clip {index}: Hook = '{hook}', Duration = {duration:.1f}s")
+                        clip_args_list.append({
+                            "base_dir": base_dir,
+                            "video_path": str(video_path),
+                            "s3_key": s3_key,
+                            "start": moment["start"],
+                            "end": moment["end"],
+                            "index": index,
+                            "transcript_segments": transcript_segments,
+                            "hook": hook,
+                            "style": request.style
+                        })
+            
+            # Optimized threading with dynamic worker count
+            max_workers = min(len(clip_args_list), 6)  # Limit to 6 workers for cost efficiency
+            print(f"Processing {len(clip_args_list)} clips using {max_workers} threads...")
+            
+            if clip_args_list:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    results = list(executor.map(generate_clip_threadsafe, clip_args_list))
+                
+                # Log results
+                successful_clips = [r for r in results if r["status"] == "success"]
+                failed_clips = [r for r in results if r["status"] == "error"]
+                
+                print(f"🎉 Processing complete: {len(successful_clips)} successful, {len(failed_clips)} failed")
+                
+                if failed_clips:
+                    for failed_clip in failed_clips:
+                        print(f"❌ Failed clip {failed_clip['index']}: {failed_clip.get('error', 'Unknown error')}")
+                
+                # Send completion webhook after successful processing
+                if request.webhook_url and successful_clips:
+                    # Parse user_id and project_id from ids
+                    user_id, project_id = request.ids.split("/", 1) if "/" in request.ids else (request.ids, "default")
+                    webhook_success = send_completion_webhook(
+                        webhook_url=request.webhook_url,
+                        user_id=user_id,
+                        project_id=project_id,
+                        status="completed"
+                    )
+                    if not webhook_success:
+                        logging.warning(f"Failed to send completion webhook for project {project_id}")
+            else:
+                print("No valid clips to process")
+                # Send webhook even if no clips were processed (but processing succeeded)
+                if request.webhook_url:
+                    user_id, project_id = request.ids.split("/", 1) if "/" in request.ids else (request.ids, "default")
+                    send_completion_webhook(
+                        webhook_url=request.webhook_url,
+                        user_id=user_id,
+                        project_id=project_id,
+                        status="completed",
+                        error_message="No valid clips found in the video"
+                    )
+
+        except Exception as e:
+            print(f"Unhandled error during process_video: {e}")
+            
+            # Send error webhook if processing failed
+            if hasattr(request, 'webhook_url') and request.webhook_url:
+                try:
+                    user_id, project_id = request.ids.split("/", 1) if "/" in request.ids else (request.ids, "default")
+                    send_completion_webhook(
+                        webhook_url=request.webhook_url,
+                        user_id=user_id,
+                        project_id=project_id,
+                        status="failed",
+                        error_message=str(e)
+                    )
+                except Exception as webhook_error:
+                    logging.error(f"Failed to send error webhook: {webhook_error}")
+            
+        finally:
+            # Clean up any temp artifacts
+            try:
+                base_dir = pathlib.Path("/tmp") / run_id
+                if base_dir.exists():
+                    print(f"Cleaning up temp dir after {base_dir}")
+                    shutil.rmtree(base_dir, ignore_errors=True)
+            except Exception as cleanup_err:
+                logging.error(f"Cleanup error: {cleanup_err}")
+
     def download_youtube_video(self, youtube_url: str, output_path: pathlib.Path):
         ydl_opts = {
             'format': 'bestvideo+bestaudio/best',
@@ -845,13 +1112,21 @@ class AiPodcastClipper:
             'noplaylist': True,
             'nocheckcertificate': True,
             'retries': 3,
+            'cookiefile': '/cookies.txt'
         }
         try:
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(youtube_url, download=True)
                 return info.get("title", "Untitled Video")
         except Exception as e:
-            raise RuntimeError(f"Failed to download YouTube video: {e}")
+            raise HTTPException(
+                status_code=422, 
+                detail={
+                    "error_type": "youtube_download_failed",
+                    "message": "Failed to download YouTube video. This could be due to bot protection, private video, or invalid URL.",
+                    "original_error": str(e)
+                }
+            )
 
     def transcribe_video(self, base_dir: str, video_path: str) -> str:
         audio_path = base_dir / 'audio.wav'
@@ -942,7 +1217,7 @@ class AiPodcastClipper:
         while chunks:
             current = chunks.pop(0)
             token_count = self.gemini_client.models.count_tokens(
-                model="gemini-2.5-pro-preview-06-05",
+                model="gemini-2.5-flash",
                 contents=str(current)
             )
             if token_count.total_tokens <= token_limit:
@@ -1013,119 +1288,22 @@ class AiPodcastClipper:
 
 
     @modal.fastapi_endpoint(method="POST")
-    def process_video(self, request: ProcessVideoRequest, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
-        try:
-            s3_key = request.s3_key
-            clip_count = request.clip_count
+    def process_video(self, request: ProcessVideoRequest, background_tasks: BackgroundTasks, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
+        # Authenticate early and respond fast for async processing
+        if token.credentials != os.environ["AUTH_TOKEN"]:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                                detail="Incorrect Bearer Token", headers={"WWW-Authenticate": "Bearer"})
 
-            if token.credentials != os.environ["AUTH_TOKEN"]:
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                                    detail="Incorrect Bearer Token", headers={"WWW-Authenticate": "Bearer"})
+        # Generate a job id and enqueue background work
+        run_id = str(uuid.uuid4())
+        background_tasks.add_task(self._process_video_job, request.model_dump(), run_id)
 
-            run_id = str(uuid.uuid4())
-            base_dir = pathlib.Path("/tmp") / run_id
-            base_dir.mkdir(parents=True, exist_ok=True)
-
-            # Download Video
-            video_path = base_dir / "input.mp4"
-
-            if request.s3_key.startswith("http://") or request.s3_key.startswith("https://"):
-                print("Detected YouTube URL, starting download...")
-                self.download_youtube_video(request.s3_key, video_path)
-                # Synthetic s3_key placeholder for naming consistency
-                s3_key = f"{uuid.uuid4()}/input.mp4"
-            else:
-                print("Downloading video from S3...")
-                s3_client = boto3.client(
-                    "s3",
-                    aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-                    aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-                    endpoint_url=os.environ["R2_ENDPOINT_URL"],
-                    region_name="auto"
-                )
-                s3_client.download_file(
-                    "ai-podcast-clipper", s3_key, str(video_path))
-
-            # 1. Transcription
-            transcript_segments_json = self.transcribe_video(
-                base_dir, video_path)
-            
-            transcript_segments = json.loads(transcript_segments_json)
-            # return transcript_segments
-
-            # 2. Identify moments for clips
-            print("Identifying clip moments")
-            identified_moments_raw = self.identify_moments(
-                transcript_segments, clip_count)
-
-            all_moments = []
-            for chunk_str in identified_moments_raw:
-                cleaned = chunk_str.strip()
-                if cleaned.startswith("```json"):
-                    cleaned = cleaned[len("```json"):].strip()
-                if cleaned.endswith("```"):
-                    cleaned = cleaned[:-len("```")].strip()
-
-                try:
-                    parsed = json.loads(cleaned)
-                    if isinstance(parsed, list):
-                        all_moments.extend(parsed)
-                    else:
-                        print("Warning: Parsed chunk is not a list, skipping")
-                except json.JSONDecodeError as e:
-                    print(f"Error parsing JSON chunk: {e}")
-                    continue
-
-            clip_moments = all_moments
-
-            # 3. Process Clips using optimized threading
-            clip_args_list = []
-            for index, moment in enumerate(clip_moments[:clip_count]):
-                if "start" in moment and "end" in moment:
-                    duration = moment["end"] - moment["start"]
-                    if duration >= 10:
-                        hook = moment.get("hook", "")
-                        print(f"Clip {index}: Hook = '{hook}', Duration = {duration:.1f}s")
-                        clip_args_list.append({
-                            "base_dir": base_dir,
-                            "video_path": str(video_path),
-                            "s3_key": s3_key,
-                            "start": moment["start"],
-                            "end": moment["end"],
-                            "index": index,
-                            "transcript_segments": transcript_segments,
-                            "hook": hook,
-                            "style": request.style
-                        })
-            
-            # Optimized threading with dynamic worker count
-            max_workers = min(len(clip_args_list), 6)  # Limit to 6 workers for cost efficiency
-            print(f"Processing {len(clip_args_list)} clips using {max_workers} threads...")
-            
-            if clip_args_list:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    results = list(executor.map(generate_clip_threadsafe, clip_args_list))
-                
-                # Log results
-                successful_clips = [r for r in results if r["status"] == "success"]
-                failed_clips = [r for r in results if r["status"] == "error"]
-                
-                print(f"🎉 Processing complete: {len(successful_clips)} successful, {len(failed_clips)} failed")
-                
-                if failed_clips:
-                    for failed_clip in failed_clips:
-                        print(f"❌ Failed clip {failed_clip['index']}: {failed_clip.get('error', 'Unknown error')}")
-            else:
-                print("No valid clips to process")
-
-        except Exception as e:
-            print(f"Unhandled error during process_video: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-        finally:
-            if base_dir.exists():
-                print(f"Cleaning up temp dir after {base_dir}")
-                shutil.rmtree(base_dir, ignore_errors=True)
+        # Immediate 202 so Inngest doesn't block on long GPU work
+        return JSONResponse(status_code=202, content={
+            "job_id": run_id,
+            "status": "accepted",
+            "message": "Processing started. You will receive a webhook upon completion."
+        })
 
 
 @app.local_entrypoint()
@@ -1137,9 +1315,11 @@ def main():
     url = ai_podcast_clipper.process_video.web_url
 
     payload = {
-        "s3_key": "3zhHBEDMtMIEiRshOHkFSV72wKfdKkKI/55b7bc53-3fe1-44c4-9996-3764e4cfa04e/original.mp4",
-        "clip_count": 10,  # Reasonable test count
-        "style": 1
+        "s3_key": "https://youtu.be/q-_hwD1jNK4?si=iS2RH7oFXmykIjw_",
+        "ids": "3zhHBEDMtMIEiRshOHkFSV72wKfdKkKI",
+        "clip_count": 1,  # Reasonable test count
+        "style": 1,
+        "webhook_url": "https://castclip.app/api/webhooks/modal-completion"  # Optional webhook
     }
     headers = {
         "Content-Type": "application/json",
@@ -1151,7 +1331,7 @@ def main():
     
     # Save the transcript response to output.json
     # transcript_data = response.json()
-    # with open("output_2.json", "w", encoding="utf-8") as f:
+    # with open("output_3.json", "w", encoding="utf-8") as f:
     #     json.dump(transcript_data, f, indent=2, ensure_ascii=False)
     
     # print("Transcript saved to output.json")
