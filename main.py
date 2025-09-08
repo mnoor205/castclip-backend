@@ -29,7 +29,7 @@ from typing import Optional
 from fastapi.responses import JSONResponse
 
 
-def send_completion_webhook(webhook_url: str, user_id: str, project_id: str, status: str = "completed", error_message: Optional[str] = None) -> bool:
+def send_completion_webhook(webhook_url: str, user_id: str, project_id: str, status: str = "completed", error_message: Optional[str] = None, clips: Optional[list] = None) -> bool:
     """
     Sends a secure POST request to the provided webhook URL to notify
     that video processing is complete or failed.
@@ -38,8 +38,9 @@ def send_completion_webhook(webhook_url: str, user_id: str, project_id: str, sta
         webhook_url: The callback URL provided by the Next.js app
         user_id: The ID of the user
         project_id: The ID of the project that was processed
-        status: Processing status ('completed', 'failed', 'error')
+        status: Processing status ('completed', 'failed', 'error', 'ready_for_review')
         error_message: Optional error message if status is 'failed' or 'error'
+        clips: Optional list of clip data for the 'ready_for_review' status
     
     Returns:
         bool: True if webhook was sent successfully, False otherwise
@@ -74,6 +75,10 @@ def send_completion_webhook(webhook_url: str, user_id: str, project_id: str, sta
             "message": error_message,
             "type": "processing_error"
         }
+    
+    # Add clips data if the analysis stage is complete
+    if clips and status == "ready_for_review":
+        payload["clips"] = clips
 
     headers = {
         "Content-Type": "application/json",
@@ -126,6 +131,19 @@ class ProcessVideoRequest(BaseModel):
     clip_count: int = 1
     style: int = 1
     webhook_url: str  # Optional webhook URL for completion notifications
+
+
+# ---- NEW: Pydantic model for the final rendering request ----
+# This defines the data structure the frontend will send when a user
+# wants to export a clip with their final edits.
+class RenderVideoRequest(BaseModel):
+    raw_clip_url: str         # R2 URL of the subtitle-less vertical video
+    output_s3_key: str        # S3 key to save the final rendered video
+    transcript_segments: list # The full, possibly edited, transcript for the clip
+    hook: Optional[str] = None
+    style: int = 1
+    # New field to specify subtitle position, e.g., {"x": 540, "y": 1600}
+    caption_position: Optional[dict] = None
 
 
 image = (modal.Image.from_registry(
@@ -200,20 +218,58 @@ def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path,
                 resize=(target_width, target_height)
             )
 
-        scale = target_height / img.shape[0]
-        resized_image = cv2.resize(
-            img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        frame_width = resized_image.shape[1]
+        # Determine processing mode based on face detection
+        if max_score_face:
+            mode = "crop"
+        else:
+            mode = "resize"
 
-        center_x = int(
-            max_score_face["x"] * scale if max_score_face else frame_width // 2)
-        top_x = max(min(center_x - target_width // 2,
-                    frame_width - target_width), 0)
+        if mode == "resize":
+            # Resize mode: Create blurred background with centered video
+            scale = target_width / img.shape[1]
+            resized_height = int(img.shape[0] * scale)
+            resized_image = cv2.resize(
+                img, (target_width, resized_height), interpolation=cv2.INTER_AREA)
 
-        image_cropped = resized_image[0:target_height,
-                                      top_x:top_x + target_width]
+            # Create blurred background
+            scale_for_bg = max(
+                target_width / img.shape[1], target_height / img.shape[0])
+            bg_width = int(img.shape[1] * scale_for_bg)
+            bg_height = int(img.shape[0] * scale_for_bg)
 
-        vout.write(image_cropped)
+            blurred_background = cv2.resize(img, (bg_width, bg_height))
+            blurred_background = cv2.GaussianBlur(
+                blurred_background, (121, 121), 0)
+
+            # Crop blurred background to target size
+            crop_x = (bg_width - target_width) // 2
+            crop_y = (bg_height - target_height) // 2
+            blurred_background = blurred_background[crop_y:crop_y +
+                                                    target_height, crop_x:crop_x + target_width]
+
+            # Center the resized video on the blurred background
+            center_y = (target_height - resized_height) // 2
+            blurred_background[center_y:center_y +
+                               resized_height, :] = resized_image
+
+            vout.write(blurred_background)
+
+        elif mode == "crop":
+            # Crop mode: Focus on the detected face (existing logic)
+            scale = target_height / img.shape[0]
+            resized_image = cv2.resize(
+                img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            frame_width = resized_image.shape[1]
+
+            center_x = int(
+                max_score_face["x"] * scale if max_score_face else frame_width // 2)
+            top_x = max(min(center_x - target_width // 2,
+                        frame_width - target_width), 0)
+
+            image_cropped = resized_image[0:target_height,
+                                          top_x:top_x + target_width]
+
+            vout.write(image_cropped)
 
     if vout:
         vout.release()
@@ -528,7 +584,8 @@ def create_optimized_ffmpeg_command_production(emoji_overlays, clip_video_path, 
 
 def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip_video_path, output_path, hook, 
                                 style=1, emoji_config_path="/emoji_config.json", 
-                                emoji_filenames_path="/emoji_filenames.json"):
+                                emoji_filenames_path="/emoji_filenames.json",
+                                caption_position: Optional[dict] = None):
     
     if style not in [1, 2, 3, 4]:
         raise ValueError("Style must be between 1 and 4")
@@ -553,6 +610,18 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
     subs.info["PlayResX"] = 1080
     subs.info["PlayResY"] = 1920
     subs.info["ScriptType"] = "v4.00+"
+
+    # ---- NEW: Handle custom caption positioning ----
+    # If caption_position is provided, create an ASS override tag `\pos(x,y)`.
+    # This tag forces the subtitle to a specific coordinate on the video,
+    # enabling the user to drag and place subtitles wherever they want.
+    position_tag = ""
+    if caption_position and "x" in caption_position and "y" in caption_position:
+        # The \pos(x,y) tag overrides default alignment and places the subtitle
+        # at the specified pixel coordinates.
+        pos_x = int(caption_position['x'])
+        pos_y = int(caption_position['y'])
+        position_tag = f"\\pos({pos_x}, {pos_y})"
 
     style_name = "Default"
     new_style = pysubs2.SSAStyle()
@@ -636,7 +705,7 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
         subs.events.append(pysubs2.SSAEvent(
             start=pysubs2.make_time(s=0),
             end=pysubs2.make_time(s=clip_end - clip_start if clip_end else 30),
-            text=hook_text,
+            text=f"{{{position_tag}}}{hook_text}", # Apply position tag to hook
             style="Hook"
         ))
 
@@ -689,10 +758,13 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
                 karaoke_text
             )
             
+            # Prepend the position tag to the karaoke text block
+            final_text = f"{{{position_tag}}}{full_karaoke_text}"
+
             subs.events.append(pysubs2.SSAEvent(
                 start=pysubs2.make_time(s=start_offset),
                 end=pysubs2.make_time(s=end_offset),
-                text=full_karaoke_text,
+                text=final_text,
                 style=style_name
             ))
             
@@ -755,10 +827,14 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
                             formatted_text += r"{\blur0.5\c&HFFFFFF&\3c&H606060&}" + word_text.upper() + " "
                         else:
                             formatted_text += word_text + " "
+                
+                # Prepend the position tag to the entire line of text
+                final_text = f"{{{position_tag}}}{formatted_text.strip()}"
+
                 subs.events.append(pysubs2.SSAEvent(
                     start=pysubs2.make_time(s=start_offset),
                     end=pysubs2.make_time(s=end_offset),
-                    text=formatted_text.strip(),
+                    text=final_text,
                     style=style_name
                 ))
             i += group_size
@@ -791,20 +867,27 @@ def get_emoji_manager(emoji_config_path="/emoji_config.json", emoji_filenames_pa
     return _global_emoji_manager
 
 
-def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_time: float, end_time: float, clip_index: int, transcript_segments: list, hook: str, style: int = 1):
-    clip_name = f"clip_{clip_index}"
+def generate_raw_clip(base_dir: pathlib.Path, original_video_path: str, s3_key: str, start_time: float, end_time: float, clip_index: int) -> str:
+    """
+    Processes a single clip segment from a larger video.
+    This function cuts the video, converts it to a vertical format,
+    and uploads the subtitle-less raw clip to R2.
+
+    Returns:
+        str: The public URL of the raw vertical clip in R2.
+    """
+    clip_name = f"clip_{clip_index}_raw"
     s3_key_dir = os.path.dirname(s3_key)
+    # The output key for the raw, subtitle-less vertical clip
     output_s3_key = f"{s3_key_dir}/{clip_name}.mp4"
-    print(f"Output S3 key: {output_s3_key}")
-    print(f"Processing clip {clip_index} with hook: '{hook}' and style: {style}")
+    print(f"Generating raw clip {clip_index} for S3 key: {output_s3_key}")
 
     clip_dir = base_dir / clip_name
     clip_dir.mkdir(parents=True, exist_ok=True)
 
     clip_segment_path = clip_dir / f"{clip_name}_segment.mp4"
     vertical_mp4_path = clip_dir / "pyavi" / "video_out_vertical.mp4"
-    subtitle_output_path = clip_dir / "pyavi" / "video_with_subtitles.mp4"
-
+    
     (clip_dir / "pywork").mkdir(exist_ok=True)
     pyframes_path = clip_dir / "pyframes"
     pyavi_path = clip_dir / "pyavi"
@@ -814,14 +897,12 @@ def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_tim
     pyavi_path.mkdir(exist_ok=True)
 
     duration = end_time - start_time
-    cut_command = (f"ffmpeg -i {original_video_path} -ss {start_time} -t {duration} "
-                   f"{clip_segment_path}")
-    subprocess.run(cut_command, shell=True, check=True,
-                   capture_output=True, text=True)
+    cut_command = (f"ffmpeg -y -i {original_video_path} -ss {start_time} -t {duration} "
+                   f"-c copy {clip_segment_path}")
+    subprocess.run(cut_command, shell=True, check=True, capture_output=True, text=True)
 
     extract_cmd = f"ffmpeg -i {clip_segment_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
-    subprocess.run(extract_cmd, shell=True,
-                   check=True, capture_output=True)
+    subprocess.run(extract_cmd, shell=True, check=True, capture_output=True)
 
     shutil.copy(clip_segment_path, base_dir / f"{clip_name}.mp4")
 
@@ -829,16 +910,12 @@ def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_tim
                         f"--videoFolder {str(base_dir)} "
                         f"--pretrainModel weight/finetuning_TalkSet.model")
 
-    columbia_start_time = time.time()
-    subprocess.run(columbia_command, cwd="/LR-ASD", shell=True)
-    columbia_end_time = time.time()
-    print(
-        f"Columbia script completed in {columbia_end_time - columbia_start_time:.2f} seconds")
+    subprocess.run(columbia_command, cwd="/LR-ASD", shell=True, check=True)
 
     tracks_path = clip_dir / "pywork" / "tracks.pckl"
     scores_path = clip_dir / "pywork" / "scores.pckl"
     if not tracks_path.exists() or not scores_path.exists():
-        raise FileNotFoundError("Tracks or scores not found for clip")
+        raise FileNotFoundError(f"Tracks or scores not found for clip {clip_index}")
 
     with open(tracks_path, "rb") as f:
         tracks = pickle.load(f)
@@ -846,72 +923,58 @@ def process_clip(base_dir: str, original_video_path: str, s3_key: str, start_tim
     with open(scores_path, "rb") as f:
         scores = pickle.load(f)
 
-    cvv_start_time = time.time()
     create_vertical_video(
-        tracks, scores, pyframes_path, pyavi_path, audio_path, vertical_mp4_path
+        tracks, scores, str(pyframes_path), str(pyavi_path), str(audio_path), str(vertical_mp4_path)
     )
-    cvv_end_time = time.time()
-    print(
-        f"Clip {clip_index} vertical video creation time: {cvv_end_time - cvv_start_time:.2f} seconds")
-
-    create_subtitles_with_ffmpeg(
-        transcript_segments, start_time, end_time, vertical_mp4_path, subtitle_output_path, hook, style=style)
-
-    # Final TikTok-friendly normalization
-    final_output_path = clip_dir / "pyavi" / "final_output.mp4"
-    ffmpeg_final_cmd = (
-        f"ffmpeg -y -i {subtitle_output_path} "
-        f"-c:v libx264 -preset slow -crf 23 "
-        f"-c:a aac -b:a 128k -movflags +faststart "
-        f"-pix_fmt yuv420p "
-        f"-metadata title='Podcast Clip' "
-        f"-metadata creation_time='{time.strftime('%Y-%m-%dT%H:%M:%S')}' "
-        f"{final_output_path}"
-    )
-    subprocess.run(ffmpeg_final_cmd, shell=True, check=True)
 
     s3_client = boto3.client(
         "s3",
         aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
         aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
         endpoint_url=os.environ["R2_ENDPOINT_URL"],
-        region_name="auto"  # Cloudflare R2 ignores region, but boto3 still requires it
+        region_name="auto"
     )
 
     s3_client.upload_file(
-        final_output_path, "ai-podcast-clipper", output_s3_key,
-        ExtraArgs={
-            'ContentType': 'video/mp4',
-            'ContentDisposition': f'attachment; filename="{os.path.basename(output_s3_key)}"',
-            'Metadata': {
-                'clip-index': str(clip_index),
-                'processed-time': time.strftime('%Y-%m-%dT%H:%M:%S')
-            }
-        }
+        str(vertical_mp4_path), "ai-podcast-clipper", output_s3_key,
+        ExtraArgs={'ContentType': 'video/mp4'}
     )
     
+    # Construct the public URL for the uploaded raw clip
+    final_url = f"https://castclip.revolt-ai.com/{output_s3_key}"
+    print(f"Uploaded raw clip {clip_index} to {final_url}")
+    
+    return final_url
 
-def generate_clip_threadsafe(args):
+
+def generate_raw_clip_threadsafe(args):
     """
-    Thread-safe wrapper for process_clip with proper error handling
-    Optimized for cost-effective parallel processing
+    Thread-safe wrapper for generate_raw_clip for parallel processing.
     """
     try:
-        process_clip(
+        raw_clip_url = generate_raw_clip(
             base_dir=args["base_dir"],
             original_video_path=args["video_path"],
             s3_key=args["s3_key"],
             start_time=args["start"],
             end_time=args["end"],
             clip_index=args["index"],
-            transcript_segments=args["transcript_segments"],
-            hook=args["hook"],
-            style=args["style"]
         )
-        print(f"✅ Clip {args['index']} completed successfully")
-        return {"index": args["index"], "status": "success"}
+        # Return all necessary data for the webhook
+        return {
+            "index": args["index"], 
+            "status": "success",
+            "raw_clip_url": raw_clip_url,
+            "transcript_segments": args["transcript_segments"],
+            "hook": args["hook"],
+            "start": args["start"],
+            "end": args["end"]
+        }
     except Exception as e:
-        print(f"❌ Clip {args['index']} failed: {str(e)}")
+        print(f"❌ Raw clip generation for index {args['index']} failed: {str(e)}")
+        # Propagate exception details
+        import traceback
+        traceback.print_exc()
         return {"index": args["index"], "status": "error", "error": str(e)}
 
 
@@ -937,7 +1000,13 @@ class AiPodcastClipper:
     def _process_video_job(self, request_dict: dict, run_id: str):
         """
         Long-running processing job executed in the background.
-        Keeps existing webhook semantics for success/failure notifications.
+        --- ARCHITECTURE CHANGE ---
+        This job is now STAGE 1 of a two-stage process.
+        1.  (This job) ANALYSIS: Transcribes video, identifies moments, cuts the
+            original video into subtitle-less vertical clips, and uploads them to R2.
+            It then sends a webhook with a list of these "raw" clips.
+        2.  (render_final_clip job) RENDERING: A separate, fast CPU job is called
+            by the frontend to burn subtitles onto a raw clip after user edits.
         """
         # Re-hydrate request model (ensures validation) without coupling to FastAPI context
         request = ProcessVideoRequest(**request_dict)
@@ -1013,14 +1082,21 @@ class AiPodcastClipper:
 
             clip_moments = all_moments
 
-            # 3. Process Clips using optimized threading
+            # 3. Process Clips into RAW vertical videos (no subtitles)
             clip_args_list = []
             for index, moment in enumerate(clip_moments[:clip_count]):
                 if "start" in moment and "end" in moment:
                     duration = moment["end"] - moment["start"]
                     if duration >= 10:
                         hook = moment.get("hook", "")
-                        print(f"Clip {index}: Hook = '{hook}', Duration = {duration:.1f}s")
+                        
+                        # Filter the full transcript to get segments only for this clip
+                        clip_specific_transcript = [
+                            s for s in transcript_segments 
+                            if s.get("start", 0) >= moment["start"] and s.get("end", 0) <= moment["end"]
+                        ]
+
+                        print(f"Queueing raw clip {index}: Hook = '{hook}', Duration = {duration:.1f}s")
                         clip_args_list.append({
                             "base_dir": base_dir,
                             "video_path": str(video_path),
@@ -1028,56 +1104,70 @@ class AiPodcastClipper:
                             "start": moment["start"],
                             "end": moment["end"],
                             "index": index,
-                            "transcript_segments": transcript_segments,
+                            "transcript_segments": clip_specific_transcript, # Pass only relevant transcript
                             "hook": hook,
-                            "style": request.style
                         })
             
             # Optimized threading with dynamic worker count
-            max_workers = min(len(clip_args_list), 6)  # Limit to 6 workers for cost efficiency
-            print(f"Processing {len(clip_args_list)} clips using {max_workers} threads...")
+            max_workers = min(len(clip_args_list), 4) # Limit workers to avoid overwhelming system
+            print(f"Processing {len(clip_args_list)} raw clips using {max_workers} threads...")
             
+            final_clips_data = []
             if clip_args_list:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    results = list(executor.map(generate_clip_threadsafe, clip_args_list))
+                    results = list(executor.map(generate_raw_clip_threadsafe, clip_args_list))
                 
-                # Log results
                 successful_clips = [r for r in results if r["status"] == "success"]
                 failed_clips = [r for r in results if r["status"] == "error"]
                 
-                print(f"🎉 Processing complete: {len(successful_clips)} successful, {len(failed_clips)} failed")
+                print(f"🎉 Raw clip processing complete: {len(successful_clips)} successful, {len(failed_clips)} failed")
                 
                 if failed_clips:
                     for failed_clip in failed_clips:
-                        print(f"❌ Failed clip {failed_clip['index']}: {failed_clip.get('error', 'Unknown error')}")
+                        print(f"❌ Failed raw clip {failed_clip['index']}: {failed_clip.get('error', 'Unknown error')}")
                 
-                # Send completion webhook after successful processing
-                if request.webhook_url and successful_clips:
-                    # Parse user_id and project_id from ids
-                    user_id, project_id = request.ids.split("/", 1) if "/" in request.ids else (request.ids, "default")
-                    webhook_success = send_completion_webhook(
-                        webhook_url=request.webhook_url,
-                        user_id=user_id,
-                        project_id=project_id,
-                        status="completed"
-                    )
-                    if not webhook_success:
-                        logging.warning(f"Failed to send completion webhook for project {project_id}")
+                # Prepare successful clip data for the webhook
+                if successful_clips:
+                    # Sort by index to maintain order
+                    successful_clips.sort(key=lambda x: x['index'])
+                    for clip_result in successful_clips:
+                        final_clips_data.append({
+                            "raw_clip_url": clip_result["raw_clip_url"],
+                            "transcript_segments": clip_result["transcript_segments"],
+                            "hook": clip_result["hook"],
+                            "start": clip_result["start"],
+                            "end": clip_result["end"]
+                        })
+
+            if request.webhook_url:
+                user_id, project_id = request.ids.split("/", 1) if "/" in request.ids else (request.ids, "default")
+                
+                if final_clips_data:
+                    # Send a list of raw clips ready for user review and editing
+                    webhook_status = "ready_for_review"
+                    webhook_error_message = None
+                else:
+                    # Handle case where no valid clips could be generated
+                    webhook_status = "failed"
+                    webhook_error_message = "No valid clips could be generated from the video."
+
+                webhook_success = send_completion_webhook(
+                    webhook_url=request.webhook_url,
+                    user_id=user_id,
+                    project_id=project_id,
+                    status=webhook_status,
+                    clips=final_clips_data,
+                    error_message=webhook_error_message
+                )
+                if not webhook_success:
+                    logging.warning(f"Failed to send '{webhook_status}' webhook for project {project_id}")
             else:
-                print("No valid clips to process")
-                # Send webhook even if no clips were processed (but processing succeeded)
-                if request.webhook_url:
-                    user_id, project_id = request.ids.split("/", 1) if "/" in request.ids else (request.ids, "default")
-                    send_completion_webhook(
-                        webhook_url=request.webhook_url,
-                        user_id=user_id,
-                        project_id=project_id,
-                        status="completed",
-                        error_message="No valid clips found in the video"
-                    )
+                print("No webhook URL provided. Skipping notification.")
 
         except Exception as e:
             print(f"Unhandled error during process_video: {e}")
+            import traceback
+            traceback.print_exc()
             
             # Send error webhook if processing failed
             if hasattr(request, 'webhook_url') and request.webhook_url:
@@ -1105,20 +1195,32 @@ class AiPodcastClipper:
 
     def download_youtube_video(self, youtube_url: str, output_path: pathlib.Path):
         ydl_opts = {
-            'format': 'bestvideo+bestaudio/best',
+            'format': 'bv*+ba/b',  # More flexible format selection
             'outtmpl': str(output_path),
             'merge_output_format': 'mp4',
-            'quiet': True,
+            'quiet': False,  # Enable logging to see what's happening
             'noplaylist': True,
             'nocheckcertificate': True,
-            'retries': 3,
-            'cookiefile': '/cookies.txt'
+            'retries': 3,  # Increase retries
+            'cookiefile': '/cookies.txt',
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
         }
         try:
             with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(youtube_url, download=True)
+                # First, try to extract info without downloading
+                info = ydl.extract_info(youtube_url, download=False)
+                
+                # Check if video is available
+                if not info.get('formats'):
+                    raise Exception("No video formats available")
+                    
+                # Now download
+                ydl.download([youtube_url])
                 return info.get("title", "Untitled Video")
         except Exception as e:
+            print(f"YouTube download error: {str(e)}")
             raise HTTPException(
                 status_code=422, 
                 detail={
@@ -1166,40 +1268,45 @@ class AiPodcastClipper:
 
     def get_prompt(self, transcript: dict, clip_count: int):
         return f""" 
-                Here is a podcast transcript, including the start and end times for each word:
-                {json.dumps(transcript, indent=2)}
-                Follow these steps to create informative clips that will help and provide value to the user:
+        You will be given the transcript of a video podcast that will include the start and end times for each word. Podcast owners often times create clips from their podcasts to post on platforms like tiktok, reels and shorts. Your job is to carefully go through the entire podcast and find moments that can are "clip-worthy." Here are some general standards that usually make good clips:
 
-                1. **Analyze the Transcript**: Carefully review the entirety of the provided podcast transcript to identify engaging stories, and anecdotes that would be valuable and engaging for up-and-coming entrepreneurs.
-                2. **Identify Attention-Grabbing Hooks**: Prioritize clips that have an attention-grabbing hook within the first 3 seconds to maximize viewer engagement. This could be a surprising statement, a controversial opinion,
-                or a compelling question. This is VERY IMPORTANT! This hook will be displayed as text on the video exactly how you give it so make sure it really forces the viewer to want to watch the clip all the way through. The max
-                length of a hook is 7 words. To help you in writing hooks I have uploaded a file that serves as a guide to writing hooks for videos on tiktok. Another thing I want you to look out for when writing hooks for clips is to 
-                make sure that the hook makes viewers want to watch the entire video and doesn't dismiss them too soon. For example if you have a hook like "You dramatically underestimate this one thing." and the clip starts with the 
-                speaker saying what the thing that "you" underestimate is in the first 5 seconds, then the viewer won't be incentivized to watch the whole thing. Keep this in mind when choosing the start and end times for clips and creating hooks.
-                3. **Select Relevant Segments**: Choose segments that include engaging stories or a question and answer, where the clip starts with a question that upon hearing the user will want to continue watching to know the answer. It is acceptable to include a few additional sentences before the story to provide context. 
-                4. **Adhere to Timestamps**: Use ONLY the start and end timestamps provided in the input. Do NOT modify the timestamps. The start and end timestamps of the clips should align perfectly with the sentence boundaries in the transcript.
-                5. **Ensure Non-Overlapping Clips**: Make sure that the selected clips do not overlap with one another. Each clip should be a distinct segment of the podcast.
-                6. **Clip Length**: Aim to generate clips that are between 20 and 60 seconds long. Include as much relevant content as possible within this timeframe. The user has requested you make 
-                {clip_count} clips. IF a specific story goes beyond the 60 second limit, you are allowed to exceed it to make sure the entire story is told.
-                7. **Exclude Irrelevant Content**: Avoid including the following in your clips:
+        1. Stories: FInd moments in the podcast where someone is telling a story.
+        2. Value/Advice: Sometimes a guest on the podcast will give some sort of advice that can be beneficial to the viewer. 
+        3. Question+Answer: This ties into the value/advice category as well as the stories category but I have it seperate because I want you to also prioritize the question that someone asks in the podcast as well as the complete answer (usually value or story), not just the answer.
+        4. Written Hook: This is by far the most important part. A hook is supposed to be short (7 words max), it should capture the viewer's attention and keep them curious and engaged throughout the entirety of the clip. You will be focusing on written hooks.
+           The hooks you will create will be displayed on the final clips verbatim so be careful. If possible try to incorporate names/identity of the people in the podcast into your hooks, this can insentivise the viewers to want to watch more. Include the name when the person is 
+           recognizable and known. If the person isn't recognizable, specify something important about that person (usually the reason they are even on the podcast). For example if the guest is some random person named John and he has made $1 million, the hook shouldn't revolve around John, because no one knows who John is. 
+           Instead it should revolve around the million dollars he made. In cases when neither of these cases are met, don't bother to incorporate names/identity of the people in the podcast into your hooks. Also refrain from mentioning the name of anything else that isn't notable, instead try to put a curious spin on it. I
+           say this because providing names of services, people, books, or anything that people don't know about can actually put them off and take them away from the video, which will be contridictary to what we are trying to do.
 
-                * Moments of greeting, thanking, or saying goodbye. This includes introductions that may be good hooks but don't actually provide value at the end. (eg. usually end with "let's get into it")
-                * Interactions or segments that do not provide value to the audience.
-                8. **Prioritize Value and Knowledge**: Ensure that the selected clips provide tangible value and knowledge to the viewer. The clips should not only be attention-grabbing but also offer meaningful insights, practical advice, or valuable information that the audience can learn from.
-                9. **Include the following**: Hook within the first 3 seconds (controversial opinion, bold claim, mystery), Standalone context (doesn't require earlier podcast sections to understand), Emotional impact (funny, shocking, inspiring, relatable).
-                10. **Format Output as JSON**: Format your output as a list of JSON objects, with each object representing a clip and containing 'start' and 'end' timestamps in seconds, and a 'hook' to help captivate the viewer as soon as they read it to incentivize them to watch the whole clip. The output should be readable by Python's `json.loads` function.
+        These are STRICT rules I want you to abide by when creating these clips:
 
-                ```json
-                [
-                {{"start": seconds, "end": seconds, "hook": "something to capture the viewers attention"}},
-                ...clip2,
-                clip3
-                ]
-                ```
-                10. **Handle No Valid Clips**: If there are no valid clips to extract based on the above criteria, output an empty list in JSON format: `[]`. This output should also be readable by `json.loads()` in Python.
+        **Adhere to Timestamps**: Use ONLY the start and end timestamps provided in the input. Do NOT modify the timestamps. The start and end timestamps of the clips should align perfectly with the sentence boundaries in the transcript.
+        
+        **Ensure Non-Overlapping Clips**: Make sure that the selected clips do not overlap with one another. Each clip should be a distinct segment of the podcast.
+        
+        **Clip Length**: Aim to generate clips that are between 20 and 120 seconds long. Include as much relevant content as possible within this timeframe. IF a specific story goes beyond the 120 second limit, you are allowed to exceed it to make sure the entire story is told, but this is only in special cases, the HARD LIMIT is 150 seconds
+       
+        **Exclude Irrelevant Content**: Exclude the following in your clips:
+            - Moments of greeting, thanking, or saying goodbye. This includes introductions that may be good hooks but don't actually provide value at the end. (eg. usually end with "let's get into it")
+            - Interactions or segments that do not provide value to the audience.
+        
+        **Assume No Context**: Assume the person viewing any of the clips you are generating has no prior knowledge of what is happening in the podcast. The clips you create will be their first impression of the podcast and the people in it.
 
-                Use the provided file and these guidelines to create clips from the entire podcast
-                """
+        **Format Output as JSON**: Format your output as a list of JSON objects, with each object representing a clip and containing 'start' and 'end' timestamps in seconds, and a 'hook' to help captivate the viewer as soon as they read it to incentivize them to watch the whole clip. The output should be readable by Python's `json.loads` function.
+
+                        ```json
+                        [
+                        {{"start": seconds, "end": seconds, "hook": "written hook"}},
+                        ...clip2,
+                        clip3
+                        ]
+                        ```
+        **Handle No Valid Clips**: If there are no valid clips to extract based on the above criteria, output an empty list in JSON format: `[]`. This output should also be readable by `json.loads()` in Python.
+
+        This is the transcript: {json.dumps(transcript, indent=2)}
+        The podcaster has requested you generate {clip_count} clips.
+        """
 
 
     def split_transcript(self, transcript: dict):
@@ -1217,7 +1324,7 @@ class AiPodcastClipper:
         while chunks:
             current = chunks.pop(0)
             token_count = self.gemini_client.models.count_tokens(
-                model="gemini-2.5-flash",
+                model="gemini-2.5-pro",
                 contents=str(current)
             )
             if token_count.total_tokens <= token_limit:
@@ -1302,37 +1409,113 @@ class AiPodcastClipper:
         return JSONResponse(status_code=202, content={
             "job_id": run_id,
             "status": "accepted",
-            "message": "Processing started. You will receive a webhook upon completion."
+            "message": "Analysis started. You will receive a webhook when clips are ready for review."
         })
+
+
+# ---- NEW: Standalone Modal CPU function for final rendering ----
+# This is STAGE 2 of the process. It's a lightweight, fast-starting CPU-only
+# function designed to be called directly by the frontend when the user clicks "Export".
+# It takes the raw clip and the user's final edits, burns the subtitles, and saves it.
+@app.function(
+    cpu=4,
+    memory=2048,
+    timeout=600,
+    min_containers=1, # Keep 1 container warm to eliminate cold starts for a responsive user experience
+    secrets=[modal.Secret.from_name("ai-podcast-clipper-secret")]
+)
+def render_final_clip(request_dict: dict):
+
+    try:
+        request = RenderVideoRequest(**request_dict)
+        run_id = str(uuid.uuid4())
+        base_dir = pathlib.Path("/tmp") / run_id
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Download the raw vertical clip from R2
+        raw_clip_path = base_dir / "raw_clip.mp4"
+        print(f"Downloading raw clip from {request.raw_clip_url}")
+        with requests.get(request.raw_clip_url, stream=True) as r:
+            r.raise_for_status()
+            with open(raw_clip_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+        # 2. Burn subtitles using the provided (and possibly edited) data
+        final_video_path = base_dir / "final_video.mp4"
+        print("Burning final subtitles...")
+        create_subtitles_with_ffmpeg(
+            transcript_segments=request.transcript_segments,
+            clip_start=0, # The clip is already cut, so we process from the beginning
+            clip_end=None, # Process until the end of the clip
+            clip_video_path=str(raw_clip_path),
+            output_path=str(final_video_path),
+            hook=request.hook,
+            style=request.style,
+            caption_position=request.caption_position
+        )
+
+        # 3. Upload the final rendered video to R2
+        print(f"Uploading final video to S3 key: {request.output_s3_key}")
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+            endpoint_url=os.environ["R2_ENDPOINT_URL"],
+            region_name="auto"
+        )
+        s3_client.upload_file(
+            str(final_video_path), "ai-podcast-clipper", request.output_s3_key,
+            ExtraArgs={
+                'ContentType': 'video/mp4',
+                'ContentDisposition': f'attachment; filename="{os.path.basename(request.output_s3_key)}"'
+            }
+        )
+
+        # 4. Clean up local files
+        shutil.rmtree(base_dir)
+
+        # 5. Return the public URL of the final video
+        final_url = f"https://castclip.revolt-ai.com/{request.output_s3_key}"
+        print(f"Successfully rendered clip: {final_url}")
+        return {"status": "success", "final_clip_url": final_url}
+
+    except Exception as e:
+        print(f"❌ Error during final rendering: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+
+# ---- NEW: FastAPI endpoint to trigger the final rendering job ----
+# The frontend will call this API route when a user clicks "Export".
+# It authenticates the request and synchronously calls the Modal function above.
+@modal.fastapi_endpoint(method="POST")
+def render_video(request: RenderVideoRequest, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
+    if token.credentials != os.environ["AUTH_TOKEN"]:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Incorrect Bearer Token", headers={"WWW-Authenticate": "Bearer"})
+
+    print(f"Received render request for s3 key: {request.output_s3_key}")
+    # Call the Modal function and wait for it to complete. The client's request
+    # will hang until the rendering is done and the result is returned.
+    result = render_final_clip.remote(request.model_dump())
+
+    if result["status"] == "success":
+        return JSONResponse(status_code=200, content=result)
+    else:
+        return JSONResponse(status_code=500, content=result)
 
 
 @app.local_entrypoint()
 def main():
-    import requests
-
-    ai_podcast_clipper = AiPodcastClipper()
-
-    url = ai_podcast_clipper.process_video.web_url
-
-    payload = {
-        "s3_key": "https://youtu.be/q-_hwD1jNK4?si=iS2RH7oFXmykIjw_",
-        "ids": "3zhHBEDMtMIEiRshOHkFSV72wKfdKkKI",
-        "clip_count": 1,  # Reasonable test count
-        "style": 1,
-        "webhook_url": "https://castclip.app/api/webhooks/modal-completion"  # Optional webhook
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer DhfvXdZywkp8PTdAYjQLrBbgBbdSztfiqZPGXdeyY96msKe6gmJXZz93fGkGUsmh"
-    }
-
-    response = requests.post(url, json=payload, headers=headers)
-    response.raise_for_status()
-    
-    # Save the transcript response to output.json
-    # transcript_data = response.json()
-    # with open("output_3.json", "w", encoding="utf-8") as f:
-    #     json.dump(transcript_data, f, indent=2, ensure_ascii=False)
-    
-    # print("Transcript saved to output.json")
+    pass
+    # The local entrypoint is kept for testing but the old payload is no longer valid
+    # for the new two-stage process. You would typically test the `process_video`
+    # endpoint and then use the output from its webhook to test the `render_video` endpoint.
+    # import requests
+    #
+    # ai_podcast_clipper = AiPodcastClipper()
+    # url = ai_podcast_clipper.process_video.web_url
+    # # ... etc ...
       

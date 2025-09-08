@@ -19,4 +19,4 @@ boto3
 fastapi[standard]
 whisperx
 hf_xet
-yt-dlp
+yt-dlp>=2025.8.22
