@@ -2,6 +2,7 @@ tqdm
 torch
 opencv-python
 ffmpegcv
+ffmpeg-python
 numpy
 python_speech_features
 scipy

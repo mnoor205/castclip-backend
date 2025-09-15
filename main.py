@@ -1,7 +1,7 @@
 import modal
 from fastapi import Depends, status, HTTPException, BackgroundTasks
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 import os
 import uuid
 import pathlib
@@ -25,8 +25,9 @@ import httpx
 import concurrent.futures
 import requests
 import logging
-from typing import Optional
+from typing import Optional, List
 from fastapi.responses import JSONResponse
+from urllib.parse import urlparse
 
 
 def send_completion_webhook(webhook_url: str, user_id: str, project_id: str, status: str = "completed", error_message: Optional[str] = None, clips: Optional[list] = None) -> bool:
@@ -87,7 +88,8 @@ def send_completion_webhook(webhook_url: str, user_id: str, project_id: str, sta
         "X-Webhook-Source": "modal-backend"
     }
 
-    logging.info(f"Sending {status} webhook for project {project_id} to {webhook_url}")
+    logging.info(
+        f"Sending {status} webhook for project {project_id} to {webhook_url}")
 
     try:
         # Use a reasonable timeout and retry configuration
@@ -100,28 +102,36 @@ def send_completion_webhook(webhook_url: str, user_id: str, project_id: str, sta
         )
 
         # Log response details for debugging
-        logging.info(f"Webhook response: {response.status_code} for project {project_id}")
+        logging.info(
+            f"Webhook response: {response.status_code} for project {project_id}")
         
         # Check for successful response (2xx status codes)
         if 200 <= response.status_code < 300:
-            logging.info(f"Successfully sent {status} webhook for project {project_id}")
+            logging.info(
+                f"Successfully sent {status} webhook for project {project_id}")
             return True
         else:
-            logging.error(f"Webhook failed with status {response.status_code} for project {project_id}")
-            logging.error(f"Response body: {response.text[:500]}")  # Log first 500 chars
+            logging.error(
+                f"Webhook failed with status {response.status_code} for project {project_id}")
+            # Log first 500 chars
+            logging.error(f"Response body: {response.text[:500]}")
             return False
 
     except requests.exceptions.Timeout:
-        logging.error(f"Webhook timeout for project {project_id} after 30 seconds")
+        logging.error(
+            f"Webhook timeout for project {project_id} after 30 seconds")
         return False
     except requests.exceptions.ConnectionError:
-        logging.error(f"Connection error sending webhook for project {project_id}")
+        logging.error(
+            f"Connection error sending webhook for project {project_id}")
         return False
     except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to send webhook for project {project_id}: {type(e).__name__}: {str(e)}")
+        logging.error(
+            f"Failed to send webhook for project {project_id}: {type(e).__name__}: {str(e)}")
         return False
     except Exception as e:
-        logging.error(f"Unexpected error sending webhook for project {project_id}: {type(e).__name__}: {str(e)}")
+        logging.error(
+            f"Unexpected error sending webhook for project {project_id}: {type(e).__name__}: {str(e)}")
         return False
 
 
@@ -136,14 +146,36 @@ class ProcessVideoRequest(BaseModel):
 # ---- NEW: Pydantic model for the final rendering request ----
 # This defines the data structure the frontend will send when a user
 # wants to export a clip with their final edits.
+class Position(BaseModel):
+    x: float
+    y: float
+
+
+class StyleOptions(BaseModel):
+    fontSize: float
+    position: Position
+
+
+class WordSegment(BaseModel):
+    word: str
+    start: float
+    end: float
+
+
 class RenderVideoRequest(BaseModel):
-    raw_clip_url: str         # R2 URL of the subtitle-less vertical video
-    output_s3_key: str        # S3 key to save the final rendered video
-    transcript_segments: list # The full, possibly edited, transcript for the clip
+    clip_id: str
+    raw_clip_url: str = Field(..., alias='raw_clip_url')
+    transcript_segments: List[WordSegment] = Field(
+        ..., alias='transcript_segments')
     hook: Optional[str] = None
-    style: int = 1
+    hook_style: Optional[StyleOptions] = Field(None, alias='hook_style')
+    project_style: int = Field(1, alias='project_style')
+    captions_style: Optional[StyleOptions] = Field(
+        None, alias='captions_style')
     # New field to specify subtitle position, e.g., {"x": 540, "y": 1600}
     caption_position: Optional[dict] = None
+
+    model_config = ConfigDict(extra='ignore')
 
 
 image = (modal.Image.from_registry(
@@ -300,7 +332,8 @@ class ProductionEmojiManager:
         
         # Load configurations
         self._load_configurations(emoji_config_path, emoji_filenames_path)
-        print(f"🚀 Production Emoji Manager: {len(self.word_to_filename)} mappings ready")
+        print(
+            f"🚀 Production Emoji Manager: {len(self.word_to_filename)} mappings ready")
     
     def _load_configurations(self, emoji_config_path, emoji_filenames_path):
         """Load and cross-reference emoji configs with available filenames"""
@@ -310,9 +343,11 @@ class ProductionEmojiManager:
             with open(emoji_filenames_path, 'r', encoding='utf-8') as f:
                 filenames_list = json.load(f)
                 self.available_filenames = set(filenames_list)
-                print(f"✅ Loaded {len(self.available_filenames)} available emoji files")
+                print(
+                    f"✅ Loaded {len(self.available_filenames)} available emoji files")
         except FileNotFoundError:
-            print(f"⚠️ {emoji_filenames_path} not found. Using emoji config only.")
+            print(
+                f"⚠️ {emoji_filenames_path} not found. Using emoji config only.")
             self.available_filenames = set()
         
         # Load word-to-emoji mappings
@@ -321,7 +356,8 @@ class ProductionEmojiManager:
                 emoji_data = json.load(f)
                 self._create_word_to_filename_mapping(emoji_data)
         except FileNotFoundError:
-            print(f"⚠️ {emoji_config_path} not found. Using minimal fallback mapping.")
+            print(
+                f"⚠️ {emoji_config_path} not found. Using minimal fallback mapping.")
             self._create_fallback_mapping()
     
     def _create_word_to_filename_mapping(self, emoji_data):
@@ -346,7 +382,8 @@ class ProductionEmojiManager:
             else:
                 unmapped_count += len(words)
         
-        print(f"📊 Mapping Stats: {mapped_count} words mapped, {unmapped_count} words unmapped")
+        print(
+            f"📊 Mapping Stats: {mapped_count} words mapped, {unmapped_count} words unmapped")
     
     def _create_emoji_to_filename_map(self):
         """Create mapping from emoji characters to filenames"""
@@ -493,7 +530,8 @@ def generate_emoji_overlays_production(clip_segments, clip_start, emoji_manager,
         
         if emoji_url:
             group_start = group[0]["start"]
-            group_end = group[-1]["end"] if i + group_size >= len(clip_segments) else min(group[-1]["end"], clip_segments[i + group_size]["start"])
+            group_end = group[-1]["end"] if i + group_size >= len(clip_segments) else min(
+                group[-1]["end"], clip_segments[i + group_size]["start"])
             
             emoji_overlays.append({
                 "url": emoji_url,
@@ -565,13 +603,15 @@ def create_optimized_ffmpeg_command_production(emoji_overlays, clip_video_path, 
         # Create time conditions for this emoji
         time_conditions = []
         for overlay in overlays:
-            time_conditions.append(f"between(t,{overlay['start']},{overlay['end']})")
+            time_conditions.append(
+                f"between(t,{overlay['start']},{overlay['end']})")
         
         enable_condition = "+".join(time_conditions)
         next_output = f"[v{filter_idx}]"
         
         # Position adjusted to be above text and centered
-        filters.append(f"{current_output}{scaled_emoji_stream} overlay=(main_w-overlay_w)/2:1200:enable='{enable_condition}' {next_output}")
+        filters.append(
+            f"{current_output}{scaled_emoji_stream} overlay=(main_w-overlay_w)/2:1200:enable='{enable_condition}' {next_output}")
         current_output = next_output
         filter_idx += 1
     
@@ -585,10 +625,15 @@ def create_optimized_ffmpeg_command_production(emoji_overlays, clip_video_path, 
 def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip_video_path, output_path, hook, 
                                 style=1, emoji_config_path="/emoji_config.json", 
                                 emoji_filenames_path="/emoji_filenames.json",
-                                caption_position: Optional[dict] = None):
+                                 hook_style_options: Optional[dict] = None,
+                                 captions_style_options: Optional[dict] = None):
     
     if style not in [1, 2, 3, 4]:
         raise ValueError("Style must be between 1 and 4")
+    
+    video_width = 1080
+    video_height = 1920
+    font_scale_factor = 5.0  # Scale frontend font size to a reasonable pixel value
     
     temp_dir = os.path.dirname(output_path) or "."
     subtitle_path = os.path.join(temp_dir, "temp_subtitles.ass")
@@ -612,16 +657,20 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
     subs.info["ScriptType"] = "v4.00+"
 
     # ---- NEW: Handle custom caption positioning ----
-    # If caption_position is provided, create an ASS override tag `\pos(x,y)`.
-    # This tag forces the subtitle to a specific coordinate on the video,
-    # enabling the user to drag and place subtitles wherever they want.
     position_tag = ""
-    if caption_position and "x" in caption_position and "y" in caption_position:
-        # The \pos(x,y) tag overrides default alignment and places the subtitle
-        # at the specified pixel coordinates.
-        pos_x = int(caption_position['x'])
-        pos_y = int(caption_position['y'])
+    if captions_style_options and 'position' in captions_style_options:
+        pos_x = int(
+            (captions_style_options['position']['x'] / 100) * video_width)
+        pos_y = int(
+            (captions_style_options['position']['y'] / 100) * video_height)
         position_tag = f"\\pos({pos_x}, {pos_y})"
+
+    # ---- NEW: Handle custom hook positioning ----
+    hook_position_tag = ""
+    if hook_style_options and 'position' in hook_style_options:
+        pos_x = int((hook_style_options['position']['x'] / 100) * video_width)
+        pos_y = int((hook_style_options['position']['y'] / 100) * video_height)
+        hook_position_tag = f"\\pos({pos_x}, {pos_y})"
 
     style_name = "Default"
     new_style = pysubs2.SSAStyle()
@@ -632,7 +681,7 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
         new_style.fontname = "Anton"
         new_style.fontsize = 140
         new_style.primarycolor = pysubs2.Color(255, 255, 255)
-        new_style.outline = 2.0
+        new_style.outline = 4.0
         new_style.shadow = 2.0
         new_style.shadowcolor = pysubs2.Color(0, 0, 0, 128)
         new_style.alignment = 2
@@ -655,6 +704,8 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
         new_style.marginr = 40
         new_style.marginv = 400  # Lowered from 800 to move text down
         new_style.spacing = 2.0
+        if captions_style_options and 'fontSize' in captions_style_options:
+            new_style.fontsize = captions_style_options['fontSize']
         
     elif style == 3:
         # Style 3: Orange karaoke style (Impact Font)
@@ -678,6 +729,12 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
         # Style 4: TODO - Future implementation  
         raise NotImplementedError("Style 4 not implemented yet")
     
+    # Override font size with scaled value from frontend if provided
+    if captions_style_options and 'fontSize' in captions_style_options:
+        scaled_font_size = int(
+            captions_style_options['fontSize'] * font_scale_factor)
+        new_style.fontsize = scaled_font_size
+    
     subs.styles[style_name] = new_style
 
     # Add hook style
@@ -697,6 +754,15 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
         hook_style.bold = True
         hook_style.spacing = 1.0
         
+        if hook_style_options:
+            if 'fontSize' in hook_style_options:
+                hook_style.fontsize = int(
+                    hook_style_options['fontSize'] * font_scale_factor)
+            if 'position' in hook_style_options:
+                # If a specific position is given, we override alignment and margins
+                hook_style.alignment = 5  # Middle-center alignment for pos() tag
+                hook_style.marginl, hook_style.marginr, hook_style.marginv = 0, 0, 0
+        
         subs.styles["Hook"] = hook_style
         
         # Add title event that spans the entire video
@@ -705,7 +771,7 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
         subs.events.append(pysubs2.SSAEvent(
             start=pysubs2.make_time(s=0),
             end=pysubs2.make_time(s=clip_end - clip_start if clip_end else 30),
-            text=f"{{{position_tag}}}{hook_text}", # Apply position tag to hook
+            text=f"{{{hook_position_tag}}}{hook_text}",
             style="Hook"
         ))
 
@@ -720,7 +786,8 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
                 break
                 
             group_start = group[0]["start"]
-            group_end = group[-1]["end"] if i + group_size >= len(clip_segments) else min(group[-1]["end"], clip_segments[i + group_size]["start"])
+            group_end = group[-1]["end"] if i + group_size >= len(clip_segments) else min(
+                group[-1]["end"], clip_segments[i + group_size]["start"])
             
             start_offset = max(0.0, group_start - clip_start)
             end_offset = max(0.0, group_end - clip_start)
@@ -728,14 +795,16 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
             karaoke_text = ""
             group_duration = group_end - group_start
             
-            total_natural_duration = sum(seg["end"] - seg["start"] for seg in group)
+            total_natural_duration = sum(
+                seg["end"] - seg["start"] for seg in group)
             
             for j, seg in enumerate(group):
                 word = seg["word"]
                 word_natural_duration = seg["end"] - seg["start"]
                 
                 if total_natural_duration > 0:
-                    word_duration = max(min_word_duration, (word_natural_duration / total_natural_duration) * group_duration)
+                    word_duration = max(
+                        min_word_duration, (word_natural_duration / total_natural_duration) * group_duration)
                 else:
                     word_duration = group_duration / len(group)
                 
@@ -745,21 +814,39 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
                 if len(word_upper) > 10 and j > 0:
                     karaoke_text += r"\N"
                 
-                karaoke_text += r"{\kf" + str(word_duration_cs) + r"}" + word_upper
+                karaoke_text += r"{\kf" + \
+                    str(word_duration_cs) + r"}" + word_upper
                 
                 if j < len(group) - 1 and len(word_upper) <= 10:
                     karaoke_text += " "
             
-            full_karaoke_text = (
-                r"{\fn" + r"Impact" + r"\fs100\b1}" +  
-                r"{\c&HFFFFFF&\2c&H00A5FF&\3c&H000000&\4c&H303030&" + 
-                r"\blur2.5\bord3\shad2}" +  
-                r"{\q3\an2}" +  
-                karaoke_text
+            # Get scaled font size from frontend, or use a default
+            font_size = new_style.fontsize
+            if captions_style_options and 'fontSize' in captions_style_options:
+                font_size = int(
+                    captions_style_options['fontSize'] * font_scale_factor)
+
+            # ---- NEW: Dynamic karaoke styling based on ideal output ----
+            # This block creates the styling seen in image #2.
+            # \fnImpact: Sets the bold font.
+            # \fs{font_size}: Sets the dynamic font size.
+            # \c&HFFFFFF&: Primary color (white).
+            # \2c&H00A5FF&: Highlight color (orange).
+            # \3c&H000000&: Outline color (black).
+            # \bord3\shad2: Border and shadow thickness.
+            # \q2: Word-by-word karaoke.
+            # \an5: Center alignment (used with \pos tag).
+            styling_tags = (
+                r"{\fnImpact"
+                r"\fs" + str(font_size) +
+                r"\c&HFFFFFF&"
+                r"\2c&H00A5FF&"
+                r"\3c&H000000&"
+                r"\bord3\shad2\q2\an5}"
             )
             
             # Prepend the position tag to the karaoke text block
-            final_text = f"{{{position_tag}}}{full_karaoke_text}"
+            final_text = f"{{{position_tag}}}{styling_tags}{karaoke_text}"
 
             subs.events.append(pysubs2.SSAEvent(
                 start=pysubs2.make_time(s=start_offset),
@@ -782,14 +869,18 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
 
             # Define colors for each set (red, yellow, green)
             set_colors = [
-                (r"\c&H0000FF&", r"\3c&H4040FF&"),  # Red text with subtle red glow
-                (r"\c&H00FFFF&", r"\3c&H40FFFF&"),  # Yellow text with subtle yellow glow  
-                (r"\c&H00FF00&", r"\3c&H40FF40&")   # Green text with subtle green glow
+                # Red text with subtle red glow
+                (r"\c&H0000FF&", r"\3c&H4040FF&"),
+                # Yellow text with subtle yellow glow
+                (r"\c&H00FFFF&", r"\3c&H40FFFF&"),
+                # Green text with subtle green glow
+                (r"\c&H00FF00&", r"\3c&H40FF40&")
             ]
             current_set_color, current_glow_color = set_colors[group_index % 3]
 
             group_start = group[0]["start"]
-            group_end = group[-1]["end"] if i + group_size >= len(clip_segments) else min(group[-1]["end"], clip_segments[i + group_size]["start"])
+            group_end = group[-1]["end"] if i + group_size >= len(clip_segments) else min(
+                group[-1]["end"], clip_segments[i + group_size]["start"])
             group_duration = group_end - group_start
             total_min_duration = min_word_duration * group_size
             word_timings = []
@@ -798,14 +889,16 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
                 total_natural = sum(seg["end"] - seg["start"] for seg in group)
                 current_time = group_start
                 for j, seg in enumerate(group):
-                    dur = max(min_word_duration, (seg["end"] - seg["start"]) / total_natural * group_duration)
+                    dur = max(
+                        min_word_duration, (seg["end"] - seg["start"]) / total_natural * group_duration)
                     word_start = current_time
                     word_end = current_time + dur
                     current_time = word_end
                     word_timings.append((word_start, word_end))
             else:
                 word_duration = group_duration / group_size
-                word_timings = [(group_start + j * word_duration, group_start + (j + 1) * word_duration) for j in range(group_size)]
+                word_timings = [(group_start + j * word_duration, group_start +
+                                 (j + 1) * word_duration) for j in range(group_size)]
 
             for j in range(group_size):
                 word_start, word_end = word_timings[j]
@@ -817,14 +910,18 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
                     if k == j:
                         if style == 2:
                             # Current word: Use set color with reduced glow for readability
-                            formatted_text += rf"{{\fs150{current_set_color}{current_glow_color}\4c&H202020&\blur1}}" + word_text.upper() + r"{\fs100\c&HFFFFFF&\3c&H606060&\4c&H202020&\blur1} "
+                            formatted_text += rf"{{\fs150{current_set_color}{current_glow_color}\4c&H202020&\blur1}}" + \
+                                word_text.upper() + \
+                                r"{\fs100\c&HFFFFFF&\3c&H606060&\4c&H202020&\blur1} "
                         else:
                             # Style 1: Blue highlighting
-                            formatted_text += r"{\c&H0000FF&}" + word_text + r"{\c&HFFFFFF&} "
+                            formatted_text += r"{\c&H0000FF&}" + \
+                                word_text + r"{\c&HFFFFFF&} "
                     else:
                         if style == 2:
                             # Other words: White with very subtle glow
-                            formatted_text += r"{\blur0.5\c&HFFFFFF&\3c&H606060&}" + word_text.upper() + " "
+                            formatted_text += r"{\blur0.5\c&HFFFFFF&\3c&H606060&}" + \
+                                word_text.upper() + " "
                         else:
                             formatted_text += word_text + " "
                 
@@ -845,16 +942,20 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
     # Generate emoji overlays for styles that support them
     emoji_overlays = []
     if style in [2]:  # Only style 2 has emojis currently
-        emoji_manager = ProductionEmojiManager(emoji_config_path, emoji_filenames_path)
-        emoji_overlays = generate_emoji_overlays_production(clip_segments, clip_start, emoji_manager)
+        emoji_manager = ProductionEmojiManager(
+            emoji_config_path, emoji_filenames_path)
+        emoji_overlays = generate_emoji_overlays_production(
+            clip_segments, clip_start, emoji_manager)
 
     # Build and execute FFmpeg command
-    ffmpeg_cmd = create_optimized_ffmpeg_command_production(emoji_overlays, clip_video_path, subtitle_path, output_path)
+    ffmpeg_cmd = create_optimized_ffmpeg_command_production(
+        emoji_overlays, clip_video_path, subtitle_path, output_path)
     subprocess.run(ffmpeg_cmd, shell=True, check=True)
 
 
 # Global emoji manager for reuse across multiple calls
 _global_emoji_manager = None
+
 
 def get_emoji_manager(emoji_config_path="/emoji_config.json", emoji_filenames_path="/emoji_filenames.json"):
     """
@@ -863,7 +964,8 @@ def get_emoji_manager(emoji_config_path="/emoji_config.json", emoji_filenames_pa
     """
     global _global_emoji_manager
     if _global_emoji_manager is None:
-        _global_emoji_manager = ProductionEmojiManager(emoji_config_path, emoji_filenames_path)
+        _global_emoji_manager = ProductionEmojiManager(
+            emoji_config_path, emoji_filenames_path)
     return _global_emoji_manager
 
 
@@ -899,7 +1001,8 @@ def generate_raw_clip(base_dir: pathlib.Path, original_video_path: str, s3_key: 
     duration = end_time - start_time
     cut_command = (f"ffmpeg -y -i {original_video_path} -ss {start_time} -t {duration} "
                    f"-c copy {clip_segment_path}")
-    subprocess.run(cut_command, shell=True, check=True, capture_output=True, text=True)
+    subprocess.run(cut_command, shell=True, check=True,
+                   capture_output=True, text=True)
 
     extract_cmd = f"ffmpeg -i {clip_segment_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
     subprocess.run(extract_cmd, shell=True, check=True, capture_output=True)
@@ -915,7 +1018,8 @@ def generate_raw_clip(base_dir: pathlib.Path, original_video_path: str, s3_key: 
     tracks_path = clip_dir / "pywork" / "tracks.pckl"
     scores_path = clip_dir / "pywork" / "scores.pckl"
     if not tracks_path.exists() or not scores_path.exists():
-        raise FileNotFoundError(f"Tracks or scores not found for clip {clip_index}")
+        raise FileNotFoundError(
+            f"Tracks or scores not found for clip {clip_index}")
 
     with open(tracks_path, "rb") as f:
         tracks = pickle.load(f)
@@ -924,7 +1028,8 @@ def generate_raw_clip(base_dir: pathlib.Path, original_video_path: str, s3_key: 
         scores = pickle.load(f)
 
     create_vertical_video(
-        tracks, scores, str(pyframes_path), str(pyavi_path), str(audio_path), str(vertical_mp4_path)
+        tracks, scores, str(pyframes_path), str(
+            pyavi_path), str(audio_path), str(vertical_mp4_path)
     )
 
     s3_client = boto3.client(
@@ -971,7 +1076,8 @@ def generate_raw_clip_threadsafe(args):
             "end": args["end"]
         }
     except Exception as e:
-        print(f"❌ Raw clip generation for index {args['index']} failed: {str(e)}")
+        print(
+            f"❌ Raw clip generation for index {args['index']} failed: {str(e)}")
         # Propagate exception details
         import traceback
         traceback.print_exc()
@@ -1096,7 +1202,8 @@ class AiPodcastClipper:
                             if s.get("start", 0) >= moment["start"] and s.get("end", 0) <= moment["end"]
                         ]
 
-                        print(f"Queueing raw clip {index}: Hook = '{hook}', Duration = {duration:.1f}s")
+                        print(
+                            f"Queueing raw clip {index}: Hook = '{hook}', Duration = {duration:.1f}s")
                         clip_args_list.append({
                             "base_dir": base_dir,
                             "video_path": str(video_path),
@@ -1104,27 +1211,33 @@ class AiPodcastClipper:
                             "start": moment["start"],
                             "end": moment["end"],
                             "index": index,
-                            "transcript_segments": clip_specific_transcript, # Pass only relevant transcript
+                            "transcript_segments": clip_specific_transcript,  # Pass only relevant transcript
                             "hook": hook,
                         })
             
             # Optimized threading with dynamic worker count
-            max_workers = min(len(clip_args_list), 4) # Limit workers to avoid overwhelming system
-            print(f"Processing {len(clip_args_list)} raw clips using {max_workers} threads...")
+            # Limit workers to avoid overwhelming system
+            max_workers = min(len(clip_args_list), 4)
+            print(
+                f"Processing {len(clip_args_list)} raw clips using {max_workers} threads...")
             
             final_clips_data = []
             if clip_args_list:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    results = list(executor.map(generate_raw_clip_threadsafe, clip_args_list))
+                    results = list(executor.map(
+                        generate_raw_clip_threadsafe, clip_args_list))
                 
-                successful_clips = [r for r in results if r["status"] == "success"]
+                successful_clips = [
+                    r for r in results if r["status"] == "success"]
                 failed_clips = [r for r in results if r["status"] == "error"]
                 
-                print(f"🎉 Raw clip processing complete: {len(successful_clips)} successful, {len(failed_clips)} failed")
+                print(
+                    f"🎉 Raw clip processing complete: {len(successful_clips)} successful, {len(failed_clips)} failed")
                 
                 if failed_clips:
                     for failed_clip in failed_clips:
-                        print(f"❌ Failed raw clip {failed_clip['index']}: {failed_clip.get('error', 'Unknown error')}")
+                        print(
+                            f"❌ Failed raw clip {failed_clip['index']}: {failed_clip.get('error', 'Unknown error')}")
                 
                 # Prepare successful clip data for the webhook
                 if successful_clips:
@@ -1140,7 +1253,8 @@ class AiPodcastClipper:
                         })
 
             if request.webhook_url:
-                user_id, project_id = request.ids.split("/", 1) if "/" in request.ids else (request.ids, "default")
+                user_id, project_id = request.ids.split(
+                    "/", 1) if "/" in request.ids else (request.ids, "default")
                 
                 if final_clips_data:
                     # Send a list of raw clips ready for user review and editing
@@ -1160,7 +1274,8 @@ class AiPodcastClipper:
                     error_message=webhook_error_message
                 )
                 if not webhook_success:
-                    logging.warning(f"Failed to send '{webhook_status}' webhook for project {project_id}")
+                    logging.warning(
+                        f"Failed to send '{webhook_status}' webhook for project {project_id}")
             else:
                 print("No webhook URL provided. Skipping notification.")
 
@@ -1172,7 +1287,8 @@ class AiPodcastClipper:
             # Send error webhook if processing failed
             if hasattr(request, 'webhook_url') and request.webhook_url:
                 try:
-                    user_id, project_id = request.ids.split("/", 1) if "/" in request.ids else (request.ids, "default")
+                    user_id, project_id = request.ids.split(
+                        "/", 1) if "/" in request.ids else (request.ids, "default")
                     send_completion_webhook(
                         webhook_url=request.webhook_url,
                         user_id=user_id,
@@ -1181,7 +1297,8 @@ class AiPodcastClipper:
                         error_message=str(e)
                     )
                 except Exception as webhook_error:
-                    logging.error(f"Failed to send error webhook: {webhook_error}")
+                    logging.error(
+                        f"Failed to send error webhook: {webhook_error}")
             
         finally:
             # Clean up any temp artifacts
@@ -1308,7 +1425,6 @@ class AiPodcastClipper:
         The podcaster has requested you generate {clip_count} clips.
         """
 
-
     def split_transcript(self, transcript: dict):
         keys = list(transcript.keys())
         midpoint = len(keys) // 2
@@ -1393,7 +1509,6 @@ class AiPodcastClipper:
 
         return results if results else "[]"
 
-
     @modal.fastapi_endpoint(method="POST")
     def process_video(self, request: ProcessVideoRequest, background_tasks: BackgroundTasks, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
         # Authenticate early and respond fast for async processing
@@ -1403,7 +1518,8 @@ class AiPodcastClipper:
 
         # Generate a job id and enqueue background work
         run_id = str(uuid.uuid4())
-        background_tasks.add_task(self._process_video_job, request.model_dump(), run_id)
+        background_tasks.add_task(
+            self._process_video_job, request.model_dump(), run_id)
 
         # Immediate 202 so Inngest doesn't block on long GPU work
         return JSONResponse(status_code=202, content={
@@ -1412,8 +1528,42 @@ class AiPodcastClipper:
             "message": "Analysis started. You will receive a webhook when clips are ready for review."
         })
 
+    # ---- NEW: FastAPI endpoint to trigger the final rendering job ----
+    # The frontend will call this API route when a user clicks "Export".
+    # It authenticates the request and synchronously calls the Modal function above.
+    @modal.fastapi_endpoint(method="POST")
+    def render_video(self, request: RenderVideoRequest, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
+        if token.credentials != os.environ["AUTH_TOKEN"]:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                                detail="Incorrect Bearer Token", headers={"WWW-Authenticate": "Bearer"})
 
-# ---- NEW: Standalone Modal CPU function for final rendering ----
+        print(f"Received render request for clip_id: {request.clip_id}")
+
+        # Construct the output S3 key from user and project IDs
+        try:
+            path_parts = urlparse(request.raw_clip_url).path.strip('/').split('/')
+            if len(path_parts) >= 3:
+                user_id = path_parts[0]
+                project_id = path_parts[1]
+                output_s3_key = f"{user_id}/{project_id}/{request.clip_id}.mp4"
+            else:
+                raise HTTPException(status_code=400, detail="Invalid raw_clip_url format")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Could not parse user_id and project_id from raw_clip_url")
+
+        # Create a dictionary for the render_final_clip function
+        render_payload = request.model_dump()
+        render_payload['output_s3_key'] = output_s3_key
+
+        # Call the Modal function and wait for it to complete.
+        result = render_final_clip.remote(render_payload)
+
+        if result["status"] == "success":
+            return JSONResponse(status_code=200, content=result)
+        else:
+            return JSONResponse(status_code=500, content=result)
+
+
 # This is STAGE 2 of the process. It's a lightweight, fast-starting CPU-only
 # function designed to be called directly by the frontend when the user clicks "Export".
 # It takes the raw clip and the user's final edits, burns the subtitles, and saves it.
@@ -1421,12 +1571,19 @@ class AiPodcastClipper:
     cpu=4,
     memory=2048,
     timeout=600,
-    min_containers=1, # Keep 1 container warm to eliminate cold starts for a responsive user experience
+    # Keep 1 container warm to eliminate cold starts for a responsive user experience
+    min_containers=1,
     secrets=[modal.Secret.from_name("ai-podcast-clipper-secret")]
 )
 def render_final_clip(request_dict: dict):
 
     try:
+        # The output_s3_key is in the raw dictionary but not the Pydantic model
+        # for validation purposes. We extract it here.
+        output_s3_key = request_dict.get("output_s3_key")
+        if not output_s3_key:
+            raise ValueError("output_s3_key is missing from the request payload")
+            
         request = RenderVideoRequest(**request_dict)
         run_id = str(uuid.uuid4())
         base_dir = pathlib.Path("/tmp") / run_id
@@ -1445,18 +1602,21 @@ def render_final_clip(request_dict: dict):
         final_video_path = base_dir / "final_video.mp4"
         print("Burning final subtitles...")
         create_subtitles_with_ffmpeg(
-            transcript_segments=request.transcript_segments,
-            clip_start=0, # The clip is already cut, so we process from the beginning
-            clip_end=None, # Process until the end of the clip
+            transcript_segments=[seg.model_dump()
+                                 for seg in request.transcript_segments],
+            clip_start=0,  # The clip is already cut, so we process from the beginning
+            clip_end=None,  # Process until the end of the clip
             clip_video_path=str(raw_clip_path),
             output_path=str(final_video_path),
             hook=request.hook,
-            style=request.style,
-            caption_position=request.caption_position
+            style=request.project_style,
+            hook_style_options=request.hook_style.model_dump(
+            ) if request.hook_style else None,
+            captions_style_options=request.captions_style.model_dump() if request.captions_style else None
         )
 
         # 3. Upload the final rendered video to R2
-        print(f"Uploading final video to S3 key: {request.output_s3_key}")
+        print(f"Uploading final video to S3 key: {output_s3_key}")
         s3_client = boto3.client(
             "s3",
             aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
@@ -1465,10 +1625,10 @@ def render_final_clip(request_dict: dict):
             region_name="auto"
         )
         s3_client.upload_file(
-            str(final_video_path), "ai-podcast-clipper", request.output_s3_key,
+            str(final_video_path), "ai-podcast-clipper", output_s3_key,
             ExtraArgs={
                 'ContentType': 'video/mp4',
-                'ContentDisposition': f'attachment; filename="{os.path.basename(request.output_s3_key)}"'
+                'ContentDisposition': f'attachment; filename="{os.path.basename(output_s3_key)}"'
             }
         )
 
@@ -1476,7 +1636,7 @@ def render_final_clip(request_dict: dict):
         shutil.rmtree(base_dir)
 
         # 5. Return the public URL of the final video
-        final_url = f"https://castclip.revolt-ai.com/{request.output_s3_key}"
+        final_url = f"https://castclip.revolt-ai.com/{output_s3_key}"
         print(f"Successfully rendered clip: {final_url}")
         return {"status": "success", "final_clip_url": final_url}
 
@@ -1487,35 +1647,585 @@ def render_final_clip(request_dict: dict):
         return {"status": "error", "message": str(e)}
 
 
-# ---- NEW: FastAPI endpoint to trigger the final rendering job ----
-# The frontend will call this API route when a user clicks "Export".
-# It authenticates the request and synchronously calls the Modal function above.
-@modal.fastapi_endpoint(method="POST")
-def render_video(request: RenderVideoRequest, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
-    if token.credentials != os.environ["AUTH_TOKEN"]:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail="Incorrect Bearer Token", headers={"WWW-Authenticate": "Bearer"})
-
-    print(f"Received render request for s3 key: {request.output_s3_key}")
-    # Call the Modal function and wait for it to complete. The client's request
-    # will hang until the rendering is done and the result is returned.
-    result = render_final_clip.remote(request.model_dump())
-
-    if result["status"] == "success":
-        return JSONResponse(status_code=200, content=result)
-    else:
-        return JSONResponse(status_code=500, content=result)
-
-
 @app.local_entrypoint()
 def main():
-    pass
-    # The local entrypoint is kept for testing but the old payload is no longer valid
-    # for the new two-stage process. You would typically test the `process_video`
-    # endpoint and then use the output from its webhook to test the `render_video` endpoint.
-    # import requests
-    #
-    # ai_podcast_clipper = AiPodcastClipper()
-    # url = ai_podcast_clipper.process_video.web_url
-    # # ... etc ...
-      
+    import requests
+
+    ai_podcast_clipper = AiPodcastClipper()
+
+    url = ai_podcast_clipper.render_video.web_url
+
+    payload = {
+        "clip_id": "52f59dea-c1ca-4a9f-8862-cef75ab21c7e",
+        "raw_clip_url": "https://castclip.revolt-ai.com/3zhHBEDMtMIEiRshOHkFSV72wKfdKkKI/554ca925-5cde-4440-9399-b917c866c648/clip_0_raw.mp4",
+        "transcript_segments": [
+            {
+                "word": "Yeah,",
+                "start": 0,
+                "end": 0.36099999999999
+            },
+            {
+                "word": "so",
+                "start": 0.3809999999999718,
+                "end": 0.6610000000000014
+            },
+            {
+                "word": "currently",
+                "start": 1.702999999999975,
+                "end": 2.202999999999975
+            },
+            {
+                "word": "I",
+                "start": 2.563999999999965,
+                "end": 2.72399999999999
+            },
+            {
+                "word": "have",
+                "start": 3.08499999999998,
+                "end": 3.305000000000007
+            },
+            {
+                "word": "a",
+                "start": 3.504999999999995,
+                "end": 3.524999999999977
+            },
+            {
+                "word": "lot",
+                "start": 3.586000000000013,
+                "end": 3.786000000000001
+            },
+            {
+                "word": "of",
+                "start": 3.825999999999965,
+                "end": 3.865999999999985
+            },
+            {
+                "word": "debt",
+                "start": 4.34699999999998,
+                "end": 4.586999999999989
+            },
+            {
+                "word": "and",
+                "start": 5.087999999999965,
+                "end": 5.228000000000009
+            },
+            {
+                "word": "I",
+                "start": 5.788999999999987,
+                "end": 5.829000000000008
+            },
+            {
+                "word": "am",
+                "start": 5.908999999999992,
+                "end": 6.810999999999979
+            },
+            {
+                "word": "currently",
+                "start": 6.911000000000001,
+                "end": 7.230999999999995
+            },
+            {
+                "word": "living",
+                "start": 7.290999999999997,
+                "end": 7.531999999999982
+            },
+            {
+                "word": "out",
+                "start": 7.611999999999966,
+                "end": 7.692000000000007
+            },
+            {
+                "word": "of",
+                "start": 7.731999999999971,
+                "end": 7.771999999999991
+            },
+            {
+                "word": "my",
+                "start": 7.891999999999996,
+                "end": 8.031999999999982
+            },
+            {
+                "word": "leased",
+                "start": 8.113,
+                "end": 8.37299999999999
+            },
+            {
+                "word": "car.",
+                "start": 8.452999999999975,
+                "end": 8.694000000000017
+            },
+            {
+                "word": "I",
+                "start": 9.213999999999999,
+                "end": 9.254000000000019
+            },
+            {
+                "word": "just",
+                "start": 9.293999999999983,
+                "end": 9.394999999999982
+            },
+            {
+                "word": "threw",
+                "start": 9.41500000000002,
+                "end": 9.59499999999997
+            },
+            {
+                "word": "a",
+                "start": 9.634999999999991,
+                "end": 9.654999999999973
+            },
+            {
+                "word": "match.",
+                "start": 9.675000000000011,
+                "end": 10.87700000000001
+            },
+            {
+                "word": "You",
+                "start": 10.89699999999999,
+                "end": 11.49799999999999
+            },
+            {
+                "word": "have",
+                "start": 11.51799999999997,
+                "end": 11.59800000000001
+            },
+            {
+                "word": "a",
+                "start": 11.61799999999999,
+                "end": 11.63799999999998
+            },
+            {
+                "word": "leased",
+                "start": 11.65800000000002,
+                "end": 11.798
+            },
+            {
+                "word": "car?",
+                "start": 11.81799999999998,
+                "end": 11.89799999999997
+            },
+            {
+                "word": "Okay.",
+                "start": 11.91899999999998,
+                "end": 12.01900000000001
+            },
+            {
+                "word": "Yeah.",
+                "start": 12.03899999999999,
+                "end": 12.339
+            },
+            {
+                "word": "So",
+                "start": 12.35899999999998,
+                "end": 12.399
+            },
+            {
+                "word": "you're",
+                "start": 12.43899999999996,
+                "end": 12.59999999999997
+            },
+            {
+                "word": "currently",
+                "start": 12.62,
+                "end": 12.92000000000002
+            },
+            {
+                "word": "homeless?",
+                "start": 12.95999999999998,
+                "end": 13.32099999999997
+            },
+            {
+                "word": "Yeah,",
+                "start": 13.74099999999999,
+                "end": 13.96199999999999
+            },
+            {
+                "word": "currently",
+                "start": 14.322,
+                "end": 14.56299999999999
+            },
+            {
+                "word": "homeless.",
+                "start": 14.58299999999997,
+                "end": 16.08499999999998
+            },
+            {
+                "word": "Okay.",
+                "start": 17.48699999999997,
+                "end": 17.58699999999999
+            },
+            {
+                "word": "Yeah.",
+                "start": 18.00799999999998,
+                "end": 18.28800000000001
+            },
+            {
+                "word": "I'm",
+                "start": 18.38900000000001,
+                "end": 18.50900000000001
+            },
+            {
+                "word": "sorry.",
+                "start": 18.589,
+                "end": 18.709
+            },
+            {
+                "word": "Yep,",
+                "start": 19.73500000000001,
+                "end": 20.31599999999997
+            },
+            {
+                "word": "it's",
+                "start": 20.33600000000001,
+                "end": 20.43599999999998
+            },
+            {
+                "word": "okay.",
+                "start": 20.49599999999998,
+                "end": 20.77600000000001
+            },
+            {
+                "word": "I",
+                "start": 21.23699999999997,
+                "end": 21.27699999999999
+            },
+            {
+                "word": "mean,",
+                "start": 21.29699999999997,
+                "end": 21.517
+            },
+            {
+                "word": "I'm-",
+                "start": 21.798,
+                "end": 21.95799999999997
+            },
+            {
+                "word": "Well,",
+                "start": 22.399,
+                "end": 22.53899999999999
+            },
+            {
+                "word": "how",
+                "start": 22.55899999999997,
+                "end": 22.63900000000001
+            },
+            {
+                "word": "long",
+                "start": 22.69900000000001,
+                "end": 22.85899999999998
+            },
+            {
+                "word": "have",
+                "start": 22.91899999999998,
+                "end": 23
+            },
+            {
+                "word": "you",
+                "start": 23.01999999999998,
+                "end": 23.12
+            },
+            {
+                "word": "been",
+                "start": 23.15999999999997,
+                "end": 23.38
+            },
+            {
+                "word": "homeless?",
+                "start": 23.38,
+                "end": 23.70099999999996
+            },
+            {
+                "word": "It's",
+                "start": 23.70099999999996,
+                "end": 23.80099999999999
+            },
+            {
+                "word": "only",
+                "start": 23.86099999999999,
+                "end": 24.00099999999998
+            },
+            {
+                "word": "been",
+                "start": 24.041,
+                "end": 24.50200000000001
+            },
+            {
+                "word": "like",
+                "start": 25.12299999999999,
+                "end": 25.50299999999999
+            },
+            {
+                "word": "three",
+                "start": 25.72300000000001,
+                "end": 25.88400000000001
+            },
+            {
+                "word": "weeks.",
+                "start": 25.92399999999998,
+                "end": 26.12399999999997
+            },
+            {
+                "word": "Wow,",
+                "start": 27.125,
+                "end": 27.38599999999997
+            },
+            {
+                "word": "what",
+                "start": 27.44599999999997,
+                "end": 27.58600000000001
+            },
+            {
+                "word": "happened",
+                "start": 27.60599999999999,
+                "end": 27.82599999999996
+            },
+            {
+                "word": "three",
+                "start": 27.846,
+                "end": 27.98599999999999
+            },
+            {
+                "word": "weeks",
+                "start": 28.02699999999999,
+                "end": 28.20699999999999
+            },
+            {
+                "word": "ago?",
+                "start": 28.28699999999998,
+                "end": 28.50700000000001
+            },
+            {
+                "word": "So",
+                "start": 29.649,
+                "end": 29.72899999999998
+            },
+            {
+                "word": "what",
+                "start": 29.74899999999997,
+                "end": 29.82900000000001
+            },
+            {
+                "word": "happened",
+                "start": 29.84899999999999,
+                "end": 30.00900000000001
+            },
+            {
+                "word": "three",
+                "start": 30.029,
+                "end": 30.12900000000002
+            },
+            {
+                "word": "weeks",
+                "start": 30.14999999999998,
+                "end": 30.32999999999998
+            },
+            {
+                "word": "ago",
+                "start": 30.34999999999997,
+                "end": 30.55000000000001
+            },
+            {
+                "word": "is",
+                "start": 30.56999999999999,
+                "end": 30.61000000000001
+            },
+            {
+                "word": "the",
+                "start": 30.971,
+                "end": 31.03100000000001
+            },
+            {
+                "word": "guys",
+                "start": 33.17399999999998,
+                "end": 33.49399999999997
+            },
+            {
+                "word": "whose",
+                "start": 33.57400000000001,
+                "end": 33.89499999999998
+            },
+            {
+                "word": "room",
+                "start": 33.97499999999997,
+                "end": 34.09499999999997
+            },
+            {
+                "word": "I",
+                "start": 34.11500000000001,
+                "end": 34.13499999999999
+            },
+            {
+                "word": "was",
+                "start": 34.17500000000001,
+                "end": 34.23500000000001
+            },
+            {
+                "word": "renting",
+                "start": 34.255,
+                "end": 34.476
+            },
+            {
+                "word": "out,",
+                "start": 34.55599999999998,
+                "end": 34.67599999999999
+            },
+            {
+                "word": "he",
+                "start": 35.577,
+                "end": 35.637
+            },
+            {
+                "word": "ended",
+                "start": 35.67699999999996,
+                "end": 35.81700000000001
+            },
+            {
+                "word": "up",
+                "start": 35.87700000000001,
+                "end": 35.93799999999999
+            },
+            {
+                "word": "selling",
+                "start": 35.95799999999997,
+                "end": 36.21800000000002
+            },
+            {
+                "word": "his",
+                "start": 36.25799999999998,
+                "end": 36.33799999999997
+            },
+            {
+                "word": "property",
+                "start": 36.37799999999999,
+                "end": 36.71899999999999
+            },
+            {
+                "word": "and",
+                "start": 36.75900000000001,
+                "end": 37.45999999999998
+            },
+            {
+                "word": "kicked",
+                "start": 37.65999999999997,
+                "end": 37.81999999999999
+            },
+            {
+                "word": "me",
+                "start": 37.83999999999997,
+                "end": 37.89999999999998
+            },
+            {
+                "word": "out.",
+                "start": 38,
+                "end": 38.14100000000002
+            },
+            {
+                "word": "And",
+                "start": 38.36099999999999,
+                "end": 38.44099999999997
+            },
+            {
+                "word": "because",
+                "start": 38.48099999999999,
+                "end": 38.86199999999997
+            },
+            {
+                "word": "I",
+                "start": 38.88200000000001,
+                "end": 38.90199999999999
+            },
+            {
+                "word": "have",
+                "start": 39.88299999999998,
+                "end": 40.16300000000001
+            },
+            {
+                "word": "no",
+                "start": 40.20400000000001,
+                "end": 40.72399999999999
+            },
+            {
+                "word": "saved",
+                "start": 41.10500000000002,
+                "end": 41.36500000000001
+            },
+            {
+                "word": "money,",
+                "start": 41.44499999999999,
+                "end": 41.64600000000002
+            },
+            {
+                "word": "I",
+                "start": 41.666,
+                "end": 41.68599999999998
+            },
+            {
+                "word": "couldn't",
+                "start": 42.06599999999997,
+                "end": 42.24599999999998
+            },
+            {
+                "word": "even",
+                "start": 42.286,
+                "end": 42.42699999999996
+            },
+            {
+                "word": "afford",
+                "start": 42.46699999999998,
+                "end": 42.80700000000002
+            },
+            {
+                "word": "a",
+                "start": 42.84699999999998,
+                "end": 42.86700000000002
+            },
+            {
+                "word": "down",
+                "start": 43.06799999999998,
+                "end": 43.32799999999997
+            },
+            {
+                "word": "payment",
+                "start": 43.36799999999999,
+                "end": 43.72800000000001
+            },
+            {
+                "word": "for",
+                "start": 44.32900000000001,
+                "end": 44.44900000000001
+            },
+            {
+                "word": "another",
+                "start": 44.50999999999999,
+                "end": 44.70999999999998
+            },
+            {
+                "word": "place.",
+                "start": 44.84999999999997,
+                "end": 45.59100000000001
+            }
+        ],
+        "hook": "mason is so nice and loving",
+        "hook_style": {
+            "fontSize": 30.15317295942923,
+            "position": {
+                "x": 48.85714285714286,
+                "y": 18.94641153131435
+            }
+        },
+        "project_style": 3,
+        "captions_style": {
+            "fontSize": 48.40808127191877,
+            "position": {
+                "x": 48.285714285714285,
+                "y": 74.50002511174725
+            }
+        }
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer DhfvXdZywkp8PTdAYjQLrBbgBbdSztfiqZPGXdeyY96msKe6gmJXZz93fGkGUsmh"
+    }
+
+    response = requests.post(url, json=payload, headers=headers)
+    response.raise_for_status()
