@@ -633,7 +633,7 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
     
     video_width = 1080
     video_height = 1920
-    font_scale_factor = 5.0  # Scale frontend font size to a reasonable pixel value
+    SCALE_CORRECTION = 1.35
     
     temp_dir = os.path.dirname(output_path) or "."
     subtitle_path = os.path.join(temp_dir, "temp_subtitles.ass")
@@ -732,7 +732,7 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
     # Override font size with scaled value from frontend if provided
     if captions_style_options and 'fontSize' in captions_style_options:
         scaled_font_size = int(
-            captions_style_options['fontSize'] * font_scale_factor)
+            captions_style_options['fontSize'] * (subs.info["PlayResY"] / 600)) * SCALE_CORRECTION
         new_style.fontsize = scaled_font_size
     
     subs.styles[style_name] = new_style
@@ -757,7 +757,7 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
         if hook_style_options:
             if 'fontSize' in hook_style_options:
                 hook_style.fontsize = int(
-                    hook_style_options['fontSize'] * font_scale_factor)
+                    hook_style_options['fontSize'] * (subs.info["PlayResY"] / 600)) * SCALE_CORRECTION
             if 'position' in hook_style_options:
                 # If a specific position is given, we override alignment and margins
                 hook_style.alignment = 5  # Middle-center alignment for pos() tag
@@ -824,7 +824,7 @@ def create_subtitles_with_ffmpeg(transcript_segments, clip_start, clip_end, clip
             font_size = new_style.fontsize
             if captions_style_options and 'fontSize' in captions_style_options:
                 font_size = int(
-                    captions_style_options['fontSize'] * font_scale_factor)
+                    captions_style_options['fontSize'] * (subs.info["PlayResY"] / 600)) * SCALE_CORRECTION
 
             # ---- NEW: Dynamic karaoke styling based on ideal output ----
             # This block creates the styling seen in image #2.
