@@ -164,6 +164,8 @@ def call_styling_endpoint(
     transcript: list,
     hook: str,
     caption_style_id: int,
+    start_time: int,
+    end_time: int,
     max_retries: int = 3
 ) -> tuple[bool, Optional[str], dict]:
     """
@@ -172,7 +174,7 @@ def call_styling_endpoint(
     Returns:
         (success: bool, error_message: Optional[str], payload: dict)
     """
-    styling_url = "https://lampless-vincent-proscholastic.ngrok-free.app/generate"
+    styling_url = "https://generate-videos-320842415829.us-south1.run.app/generate"
     
     # Default style options
     payload = {
@@ -196,7 +198,10 @@ def call_styling_endpoint(
                 "y": 76.50111739702355
             }
         },
-        "captionStyleId": caption_style_id
+        "captionStyleId": caption_style_id,
+        "type": "generate",
+        "start": start_time,
+        "end": end_time,
     }
     
     for attempt in range(max_retries):
@@ -468,7 +473,9 @@ def generate_raw_clip_threadsafe(args):
             s3_key=output_s3_key,
             transcript=args["transcript_segments"],
             hook=args["hook"],
-            caption_style_id=args["caption_style_id"]
+            caption_style_id=args["caption_style_id"],
+            start_time=args["start"],
+            end_time=args["end"]
         )
         
         return {
@@ -990,7 +997,7 @@ def main():
         "s3_key": "https://youtu.be/wm-hqM9F8BM?si=OYLAHbJ8oCX9t0-R",
         "user_id": "3zhHBEDMtMIEiRshOHkFSV72wKfdKkKI",
         "project_id": "123",
-        "clip_count": 1,
+        "clip_count": 3,
         "style": 1,
         "webhook_url": "https://lampless-vincent-proscholastic.ngrok-free.app/webhooks/modal"
     }
