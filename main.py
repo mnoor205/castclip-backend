@@ -27,6 +27,8 @@ import logging
 from typing import Optional
 from fastapi.responses import JSONResponse
 
+os.environ.setdefault("PYANNOTE_AUDIO_DISABLE_CUDA", "True")
+
 
 def send_completion_webhook(webhook_url: str, user_id: str, project_id: str, status: str = "completed", error_message: Optional[str] = None, clips: Optional[list] = None) -> bool:
     """
@@ -140,7 +142,10 @@ class ProcessVideoRequest(BaseModel):
 
 image = (modal.Image.from_registry(
     "nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.12")
-    .apt_install(["ffmpeg", "libgl1-mesa-glx", "wget", "libcudnn8", "libcudnn8-dev"])
+    .apt_install(["ffmpeg", "libgl1-mesa-glx", "wget", "libcudnn9-cuda-12", "libcudnn9-dev-cuda-12"])
+    .env({
+        "LD_LIBRARY_PATH": "/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}"
+    })
     .pip_install_from_requirements("requirements.txt")
     .add_local_dir("LR-ASD", "/LR-ASD", copy=True)
     .add_local_file("cookies.txt", "/cookies.txt"))
@@ -166,6 +171,8 @@ def call_styling_endpoint(
     caption_style_id: int,
     start_time: int,
     end_time: int,
+    clip_number: int = 1,
+    total_clips: int = 1,
     max_retries: int = 3
 ) -> tuple[bool, Optional[str], dict]:
     """
@@ -202,6 +209,9 @@ def call_styling_endpoint(
         "type": "generate",
         "start": start_time,
         "end": end_time,
+        "clipIndex": clip_number,
+        "totalClips": total_clips,
+        "isLastClip": clip_number == total_clips
     }
     
     for attempt in range(max_retries):
@@ -449,13 +459,13 @@ def generate_raw_clip(base_dir: pathlib.Path,
 
 def generate_raw_clip_threadsafe(args):
     """
-    Thread-safe wrapper for generate_raw_clip with immediate styling handoff.
-    Generates raw clip, then immediately calls styling endpoint in parallel.
+    Thread-safe wrapper for generate_raw_clip.
+    Generates raw clip only - styling handoff happens later with correct clip numbers.
     """
     clip_id = str(uuid.uuid4())
     
     try:
-        # Step 1: Generate raw vertical clip
+        # Generate raw vertical clip
         raw_clip_url, output_s3_key = generate_raw_clip(
             base_dir=args["base_dir"],
             original_video_path=args["video_path"],
@@ -465,28 +475,12 @@ def generate_raw_clip_threadsafe(args):
             clip_index=args["index"]
         )
         
-        # Step 2: Immediately call styling endpoint (parallel handoff)
-        styling_success, styling_error, styling_payload = call_styling_endpoint(
-            user_id=args["user_id"],
-            project_id=args["project_id"],
-            clip_id=clip_id,
-            s3_key=output_s3_key,
-            transcript=args["transcript_segments"],
-            hook=args["hook"],
-            caption_style_id=args["caption_style_id"],
-            start_time=args["start"],
-            end_time=args["end"]
-        )
-        
         return {
             "index": args["index"], 
             "status": "success",
             "clip_id": clip_id,
             "raw_clip_url": raw_clip_url,
             "s3_key": output_s3_key,
-            "styling_success": styling_success,
-            "styling_error": styling_error,
-            "styling_payload": styling_payload,
             "transcript_segments": args["transcript_segments"],
             "hook": args["hook"],
             "start": args["start"],
@@ -648,13 +642,17 @@ class AiPodcastClipper:
                             "caption_style_id": request.style,
                         })
             
+            # DON'T set clip_number/total_clips yet - we need to generate first
+            # to know which clips will succeed
+            
             # Optimized threading with dynamic worker count
             # Limit workers to avoid overwhelming system
             max_workers = min(len(clip_args_list), 4)
             print(
-                f"Processing {len(clip_args_list)} raw clips with parallel styling handoff using {max_workers} threads...")
+                f"Processing {len(clip_args_list)} raw clips (will determine final count after generation)...")
             
             if clip_args_list:
+                # PHASE 1: Generate all raw clips (without calling styling yet)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                     results = list(executor.map(
                         generate_raw_clip_threadsafe, clip_args_list))
@@ -676,24 +674,50 @@ class AiPodcastClipper:
                 if successful_raw_clips:
                     successful_raw_clips.sort(key=lambda x: x['index'])
                     
+                    # PHASE 2: Now call styling endpoint with correct clip numbers
+                    actual_total_clips = len(successful_raw_clips)
+                    print(f"📤 Sending {actual_total_clips} successful clips to styling service...")
+                    
+                    for idx, clip in enumerate(successful_raw_clips):
+                        clip_number = idx + 1
+                        is_last = (clip_number == actual_total_clips)
+                        
+                        # Call styling endpoint with correct metadata
+                        styling_success, styling_error, styling_payload = call_styling_endpoint(
+                            user_id=request.user_id,
+                            project_id=request.project_id,
+                            clip_id=clip["clip_id"],
+                            s3_key=clip["s3_key"],
+                            transcript=clip["transcript_segments"],
+                            hook=clip["hook"],
+                            caption_style_id=request.style,
+                            start_time=clip["start"],
+                            end_time=clip["end"],
+                            clip_number=clip_number,
+                            total_clips=actual_total_clips
+                        )
+                        
+                        # Update clip with styling results
+                        clip["styling_success"] = styling_success
+                        clip["styling_error"] = styling_error
+                        clip["styling_payload"] = styling_payload
+                        
+                        print(f"📝 Clip {clip['index']}: clipIndex={clip_number}/{actual_total_clips}, isLastClip={is_last}, styling={'✅' if styling_success else '❌'}")
+                        
+                        # Collect payload for debugging
+                        if styling_payload:
+                            payloads.append({
+                                "clip_index": clip["index"],
+                                "payload": styling_payload
+                            })
+                    
                     styling_success_count = sum(
                         1 for clip in successful_raw_clips if clip.get("styling_success"))
                     styling_failed_count = sum(
                         1 for clip in successful_raw_clips if not clip.get("styling_success"))
                     
                     print(
-                        f"📤 Styling handoff: {styling_success_count} sent successfully, {styling_failed_count} failed")
-                    
-                    # Log styling failures and collect payloads
-                    for clip in successful_raw_clips:
-                        if clip.get("styling_payload"):
-                            payloads.append({
-                                "clip_index": clip["index"],
-                                "payload": clip["styling_payload"]
-                            })
-                        if not clip.get("styling_success"):
-                            print(
-                                f"⚠️ Styling handoff failed for clip {clip['index']}: {clip.get('styling_error', 'Unknown error')}")
+                        f"📤 Styling handoff complete: {styling_success_count} sent successfully, {styling_failed_count} failed")
                 
                 # Only send error webhook if ALL clips failed to generate raw
                 # Styling endpoint will handle success webhooks
@@ -889,7 +913,7 @@ class AiPodcastClipper:
         while chunks:
             current = chunks.pop(0)
             token_count = self.gemini_client.models.count_tokens(
-                model="gemini-2.5-flash",
+                model="gemini-2.5-pro",
                 contents=str(current)
             )
             if token_count.total_tokens <= token_limit:
@@ -919,7 +943,7 @@ class AiPodcastClipper:
             for attempt in range(1, max_retries + 1):
                 try:
                     response = self.gemini_client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model="gemini-2.5-pro",
                         config=types.GenerateContentConfig(safety_settings=[
                             types.SafetySetting(
                                 category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
