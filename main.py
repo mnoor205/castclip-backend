@@ -30,105 +30,6 @@ from fastapi.responses import JSONResponse
 os.environ.setdefault("PYANNOTE_AUDIO_DISABLE_CUDA", "True")
 
 
-def send_completion_webhook(webhook_url: str, user_id: str, project_id: str, status: str = "completed", error_message: Optional[str] = None, clips: Optional[list] = None) -> bool:
-    """
-    Sends a secure POST request to the provided webhook URL to notify
-    that video processing is complete or failed.
-
-    Args:
-        webhook_url: The callback URL provided by the Next.js app
-        user_id: The ID of the user
-        project_id: The ID of the project that was processed
-        status: Processing status ('completed', 'failed', 'error')
-        error_message: Optional error message if status is 'failed' or 'error'
-        clips: Optional list of clip data with raw_clip_url, transcript_segments, hook, start, end
-    
-    Returns:
-        bool: True if webhook was sent successfully, False otherwise
-    """
-    if not webhook_url or not webhook_url.strip():
-        logging.warning("Webhook URL not provided, skipping notification")
-        return False
-
-    print(f"Webhook URL: {webhook_url}")
-    
-    secret_token = os.getenv("WEBHOOK_SECRET")
-    if not secret_token:
-        logging.critical("WEBHOOK_SECRET environment variable not set")
-        return False
-
-    # Construct payload with comprehensive information
-    payload = {
-        "user_id": user_id,
-        "project_id": project_id,
-        "status": status,
-        "timestamp": int(time.time()),
-        "processing_completed_at": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    }
-    
-    # Add error information if applicable
-    if error_message and status in ["failed", "error"]:
-        payload["error"] = {
-            "message": error_message,
-            "type": "processing_error"
-        }
-    
-    # Add clips data when available for completed
-    if clips and status == "completed":
-        payload["clips"] = clips
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {secret_token}",
-        "User-Agent": "AI-Podcast-Clipper/1.0",
-        "X-Webhook-Source": "modal-backend"
-    }
-
-    logging.info(
-        f"Sending {status} webhook for project {project_id} to {webhook_url}")
-
-    try:
-        # Use a reasonable timeout and retry configuration
-        response = requests.post(
-            webhook_url, 
-            json=payload, 
-            headers=headers, 
-            timeout=30,
-            allow_redirects=False  # Don't follow redirects for security
-        )
-
-        # Log response details for debugging
-        logging.info(
-            f"Webhook response: {response.status_code} for project {project_id}")
-        
-        # Check for successful response (2xx status codes)
-        if 200 <= response.status_code < 300:
-            logging.info(
-                f"Successfully sent {status} webhook for project {project_id}")
-            return True
-        else:
-            logging.error(
-                f"Webhook failed with status {response.status_code} for project {project_id}")
-            # Log first 500 chars
-            logging.error(f"Response body: {response.text[:500]}")
-            return False
-
-    except requests.exceptions.Timeout:
-        logging.error(
-            f"Webhook timeout for project {project_id} after 30 seconds")
-        return False
-    except requests.exceptions.ConnectionError:
-        logging.error(
-            f"Connection error sending webhook for project {project_id}")
-        return False
-    except requests.exceptions.RequestException as e:
-        logging.error(
-            f"Failed to send webhook for project {project_id}: {type(e).__name__}: {str(e)}")
-        return False
-    except Exception as e:
-        logging.error(
-            f"Unexpected error sending webhook for project {project_id}: {type(e).__name__}: {str(e)}")
-        return False
 
 
 class ProcessVideoRequest(BaseModel):
@@ -137,7 +38,6 @@ class ProcessVideoRequest(BaseModel):
     project_id: str
     clip_count: int = 1
     style: int = 1
-    webhook_url: str  # Webhook URL for completion notifications
 
 
 image = (modal.Image.from_registry(
@@ -172,16 +72,16 @@ def call_styling_endpoint(
     start_time: int,
     end_time: int,
     clip_number: int = 1,
-    total_clips: int = 1,
-    max_retries: int = 3
+    total_clips: int = 1
 ) -> tuple[bool, Optional[str], dict]:
     """
-    Call the styling endpoint to generate styled video with retries.
+    Call the styling endpoint to generate styled video.
+    The styling service processes asynchronously and sends a webhook when complete.
     
     Returns:
         (success: bool, error_message: Optional[str], payload: dict)
     """
-    styling_url = "https://generate-videos-320842415829.us-south1.run.app/generate"
+    styling_url = "https://gnerate-videos-320842415829.us-south1.run.app/generate"
     
     # Default style options
     payload = {
@@ -214,50 +114,36 @@ def call_styling_endpoint(
         "isLastClip": clip_number == total_clips
     }
     
-    for attempt in range(max_retries):
-        try:
-            print(f"Calling styling endpoint for clip {clip_id} (attempt {attempt + 1}/{max_retries})")
-            response = requests.post(
-                styling_url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=30
-            )
-            
-            if response.status_code in [200, 202]:
-                print(f"✅ Successfully sent clip {clip_id} to styling service")
-                return (True, None, payload)
-            elif response.status_code >= 500:
-                # Server error - retry with exponential backoff
-                print(f"⚠️ Styling endpoint returned {response.status_code}, retrying...")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                continue
-            else:
-                # Client error - don't retry
-                error_msg = f"Styling endpoint rejected clip with status {response.status_code}: {response.text[:200]}"
-                print(f"❌ {error_msg}")
-                return (False, error_msg, payload)
-                
-        except requests.exceptions.Timeout:
-            print(f"⚠️ Styling endpoint timeout for clip {clip_id}")
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
-            continue
-        except requests.exceptions.RequestException as e:
-            error_msg = f"Request error calling styling endpoint: {str(e)}"
-            print(f"❌ {error_msg}")
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
-            continue
-        except Exception as e:
-            error_msg = f"Unexpected error calling styling endpoint: {str(e)}"
+    try:
+        print(f"Sending clip {clip_id} to styling service...")
+        response = requests.post(
+            styling_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=10  # Just need to confirm request was accepted
+        )
+        
+        if response.status_code in [200, 202]:
+            print(f"✅ Successfully sent clip {clip_id} to styling service")
+            return (True, None, payload)
+        else:
+            error_msg = f"Styling endpoint returned {response.status_code}: {response.text[:200]}"
             print(f"❌ {error_msg}")
             return (False, error_msg, payload)
-    
-    error_msg = f"Max retries ({max_retries}) exceeded for styling endpoint"
-    print(f"❌ {error_msg}")
-    return (False, error_msg, payload)
+            
+    except requests.exceptions.Timeout:
+        # Timeout is a real error - styling service should respond quickly to accept the request
+        error_msg = f"Styling endpoint timeout after 10s for clip {clip_id}"
+        print(f"❌ {error_msg}")
+        return (False, error_msg, payload)
+    except requests.exceptions.RequestException as e:
+        error_msg = f"Request error calling styling endpoint: {str(e)}"
+        print(f"❌ {error_msg}")
+        return (False, error_msg, payload)
+    except Exception as e:
+        error_msg = f"Unexpected error calling styling endpoint: {str(e)}"
+        print(f"❌ {error_msg}")
+        return (False, error_msg, payload)
 
 
 def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path, output_path, framerate=25):
@@ -364,13 +250,251 @@ def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path,
     if vout:
         vout.release()
 
-    ffmpeg_command = (f"ffmpeg -y -i {temp_video_path} -i {audio_path} "
-                      f"-c:v h264 -preset fast -crf 23 -c:a aac -b:a 128k "
-                      f"{output_path}")
-    subprocess.run(ffmpeg_command, shell=True, check=True, text=True)
+    try:
+        ffmpeg_command = (f"ffmpeg -y -i {temp_video_path} -i {audio_path} "
+                          f"-c:v copy -c:a aac -b:a 128k -movflags +faststart "
+                          f"{output_path}")
+        subprocess.run(ffmpeg_command, shell=True, check=True, text=True)
+    except subprocess.CalledProcessError:
+        # Fallback to re-encode video if stream copy fails
+        ffmpeg_fallback = (f"ffmpeg -y -i {temp_video_path} -i {audio_path} "
+                           f"-c:v h264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "
+                           f"{output_path}")
+        subprocess.run(ffmpeg_fallback, shell=True, check=True, text=True)
 
 
 
+
+def compute_faces_by_frame(tracks, scores, num_frames: int):
+    faces = [[] for _ in range(num_frames)]
+    for tidx, track in enumerate(tracks):
+        score_array = scores[tidx]
+        frames_list = track["track"]["frame"].tolist()
+        for fidx, frame in enumerate(frames_list):
+            slice_start = max(fidx - 30, 0)
+            slice_end = min(fidx + 30, len(score_array))
+            score_slice = score_array[slice_start:slice_end]
+            avg_score = float(np.mean(score_slice) if len(score_slice) > 0 else 0)
+            if 0 <= frame < len(faces):
+                faces[frame].append({
+                    'track': tidx,
+                    'score': avg_score,
+                    's': track['proc_track']["s"][fidx],
+                    'x': track['proc_track']["x"][fidx],
+                    'y': track['proc_track']["y"][fidx]
+                })
+    return faces
+
+
+def create_vertical_video_segment(faces_by_frame, pyframes_path: str, output_video_only_path: str, frame_start: int, frame_end: int, framerate: int = 25):
+    target_width = 1080
+    target_height = 1920
+
+    flist = glob.glob(os.path.join(pyframes_path, "*.jpg"))
+    flist.sort()
+
+    vout = None
+    for frame_index in tqdm(range(frame_start, min(frame_end, len(flist))), total=max(0, frame_end - frame_start), desc="Rendering clip from batch frames"):
+        fname = flist[frame_index]
+        img = cv2.imread(fname)
+        if img is None:
+            continue
+
+        current_faces = faces_by_frame[frame_index] if frame_index < len(faces_by_frame) else []
+        max_score_face = max(current_faces, key=lambda face: face['score']) if current_faces else None
+        if max_score_face and max_score_face['score'] < 0:
+            max_score_face = None
+
+        if vout is None:
+            vout = ffmpegcv.VideoWriterNV(
+                file=output_video_only_path,
+                codec=None,
+                fps=framerate,
+                resize=(target_width, target_height)
+            )
+
+        if max_score_face:
+            scale = target_height / img.shape[0]
+            resized_image = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            frame_width = resized_image.shape[1]
+            center_x = int(max_score_face["x"] * scale)
+            top_x = max(min(center_x - target_width // 2, frame_width - target_width), 0)
+            image_cropped = resized_image[0:target_height, top_x:top_x + target_width]
+            vout.write(image_cropped)
+        else:
+            scale = target_width / img.shape[1]
+            resized_height = int(img.shape[0] * scale)
+            resized_image = cv2.resize(img, (target_width, resized_height), interpolation=cv2.INTER_AREA)
+            scale_for_bg = max(target_width / img.shape[1], target_height / img.shape[0])
+            bg_width = int(img.shape[1] * scale_for_bg)
+            bg_height = int(img.shape[0] * scale_for_bg)
+            blurred_background = cv2.resize(img, (bg_width, bg_height))
+            blurred_background = cv2.GaussianBlur(blurred_background, (61, 61), 0)
+            crop_x = (bg_width - target_width) // 2
+            crop_y = (bg_height - target_height) // 2
+            blurred_background = blurred_background[crop_y:crop_y + target_height, crop_x:crop_x + target_width]
+            center_y = (target_height - resized_height) // 2
+            blurred_background[center_y:center_y + resized_height, :] = resized_image
+            vout.write(blurred_background)
+
+    if vout:
+        vout.release()
+
+
+def build_batch_video(base_dir: pathlib.Path, original_video_path: str, clip_args_list: list[dict]) -> tuple[str, pathlib.Path, list[float]]:
+    batch_name = "batch_input"
+    batch_video_path = base_dir / f"{batch_name}.mp4"
+
+    segments_dir = base_dir / "batch_segments"
+    segments_dir.mkdir(exist_ok=True)
+
+    offsets = []
+    current_offset = 0.0
+    list_file_path = base_dir / "batch_concat_list.txt"
+
+    with open(list_file_path, "w", encoding="utf-8") as lf:
+        for idx, args in enumerate(clip_args_list):
+            start = args["start"]
+            end = args["end"]
+            duration = max(end - start, 0)
+            seg_path = segments_dir / f"seg_{idx:03d}.mp4"
+            cut_cmd = (f"ffmpeg -y -i {original_video_path} -ss {start} -t {duration} -c copy {seg_path}")
+            subprocess.run(cut_cmd, shell=True, check=True, capture_output=True, text=True)
+            lf.write(f"file '{seg_path}'\n")
+            offsets.append(current_offset)
+            current_offset += duration
+
+    concat_cmd = (f"ffmpeg -y -f concat -safe 0 -i {list_file_path} -c copy {batch_video_path}")
+    subprocess.run(concat_cmd, shell=True, check=True, capture_output=True, text=True)
+
+    return batch_name, batch_video_path, offsets
+
+
+def generate_raw_clips_batched(base_dir: pathlib.Path, original_video_path: str, s3_key: str, clip_args_list: list[dict]) -> list[dict]:
+    try:
+        batch_name, batch_video_path, offsets = build_batch_video(base_dir, original_video_path, clip_args_list)
+
+        columbia_command = (f"python Columbia_test.py --videoName {batch_name} "
+                            f"--videoFolder {str(base_dir)} "
+                            f"--pretrainModel weight/finetuning_TalkSet.model")
+        subprocess.run(columbia_command, cwd="/LR-ASD", shell=True, check=True)
+
+        batch_dir = base_dir / batch_name
+        tracks_path = batch_dir / "pywork" / "tracks.pckl"
+        scores_path = batch_dir / "pywork" / "scores.pckl"
+        pyframes_path = batch_dir / "pyframes"
+        pyavi_path = batch_dir / "pyavi"
+
+        if not tracks_path.exists() or not scores_path.exists():
+            raise FileNotFoundError("Batch tracks or scores not found")
+
+        with open(tracks_path, "rb") as f:
+            tracks = pickle.load(f)
+        with open(scores_path, "rb") as f:
+            scores = pickle.load(f)
+
+        flist = glob.glob(os.path.join(str(pyframes_path), "*.jpg"))
+        flist.sort()
+        framerate = 25
+
+        faces_by_frame = compute_faces_by_frame(tracks, scores, len(flist))
+
+        results = []
+        max_workers = min(len(clip_args_list), 3)
+
+        def render_one(idx_and_args):
+            idx, args = idx_and_args
+            clip_id = str(uuid.uuid4())
+            try:
+                start = args["start"]
+                end = args["end"]
+                duration = max(end - start, 0)
+                batch_offset = offsets[idx]
+                frame_start = int(batch_offset * framerate)
+                frame_end = int((batch_offset + duration) * framerate)
+
+                clip_name = f"clip_{args['index']}_raw"
+                clip_dir = base_dir / clip_name
+                clip_dir.mkdir(parents=True, exist_ok=True)
+                (clip_dir / "pywork").mkdir(exist_ok=True)
+                pyavi_out = clip_dir / "pyavi"
+                pyavi_out.mkdir(exist_ok=True)
+                audio_path = pyavi_out / "audio.wav"
+                video_only_path = pyavi_out / "video_only.mp4"
+                vertical_mp4_path = clip_dir / "pyavi" / "video_out_vertical.mp4"
+
+                extract_cmd = f"ffmpeg -y -ss {start} -t {duration} -i {original_video_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
+                subprocess.run(extract_cmd, shell=True, check=True, capture_output=True, text=True)
+
+                create_vertical_video_segment(
+                    faces_by_frame=faces_by_frame,
+                    pyframes_path=str(pyframes_path),
+                    output_video_only_path=str(video_only_path),
+                    frame_start=frame_start,
+                    frame_end=frame_end,
+                    framerate=framerate,
+                )
+
+                try:
+                    ffmpeg_command = (f"ffmpeg -y -i {video_only_path} -i {audio_path} "
+                                      f"-c:v copy -c:a aac -b:a 128k -movflags +faststart "
+                                      f"{vertical_mp4_path}")
+                    subprocess.run(ffmpeg_command, shell=True, check=True, text=True)
+                except subprocess.CalledProcessError:
+                    ffmpeg_fallback = (f"ffmpeg -y -i {video_only_path} -i {audio_path} "
+                                       f"-c:v h264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart "
+                                       f"{vertical_mp4_path}")
+                    subprocess.run(ffmpeg_fallback, shell=True, check=True, text=True)
+
+                s3_client = boto3.client(
+                    "s3",
+                    aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+                    aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+                    endpoint_url=os.environ["R2_ENDPOINT_URL"],
+                    region_name="auto"
+                )
+
+                s3_key_dir = os.path.dirname(s3_key)
+                output_s3_key = f"{s3_key_dir}/{clip_name}.mp4"
+                s3_client.upload_file(
+                    str(vertical_mp4_path), "ai-podcast-clipper", output_s3_key,
+                    ExtraArgs={'ContentType': 'video/mp4'}
+                )
+
+                raw_clip_url = f"https://castclip.revolt-ai.com/{output_s3_key}"
+
+                return {
+                    "index": args["index"],
+                    "status": "success",
+                    "clip_id": clip_id,
+                    "raw_clip_url": raw_clip_url,
+                    "s3_key": output_s3_key,
+                    "transcript_segments": args["transcript_segments"],
+                    "hook": args["hook"],
+                    "start": args["start"],
+                    "end": args["end"]
+                }
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                return {
+                    "index": args["index"],
+                    "status": "error",
+                    "error": str(e),
+                    "clip_id": clip_id
+                }
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for res in executor.map(render_one, list(enumerate(clip_args_list))):
+                results.append(res)
+
+        return results
+    except Exception as e:
+        print(f"Batch LR-ASD pipeline failed, falling back to per-clip: {e}")
+        # Fallback to original per-clip generation
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(clip_args_list), 4)) as executor:
+            results = list(executor.map(generate_raw_clip_threadsafe, clip_args_list))
+        return results
 
 def generate_raw_clip(base_dir: pathlib.Path,
                                original_video_path: str,
@@ -405,12 +529,12 @@ def generate_raw_clip(base_dir: pathlib.Path,
     pyavi_path.mkdir(exist_ok=True)
 
     duration = end_time - start_time
-    cut_command = (f"ffmpeg -y -i {original_video_path} -ss {start_time} -t {duration} "
+    cut_command = (f"ffmpeg -y -ss {start_time} -t {duration} -i {original_video_path} "
                    f"-c copy {clip_segment_path}")
     subprocess.run(cut_command, shell=True, check=True,
                    capture_output=True, text=True)
 
-    extract_cmd = f"ffmpeg -i {clip_segment_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
+    extract_cmd = f"ffmpeg -y -i {clip_segment_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
     subprocess.run(extract_cmd, shell=True, check=True, capture_output=True)
 
     shutil.copy(clip_segment_path, base_dir / f"{clip_name}.mp4")
@@ -519,6 +643,7 @@ class AiPodcastClipper:
         self.gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
         print("Generated Gemini Client")
 
+    @modal.method()
     def _process_video_job(self, request_dict: dict, run_id: str):
         """
         Raw clip generation pipeline with parallel styling handoff.
@@ -652,11 +777,14 @@ class AiPodcastClipper:
                 f"Processing {len(clip_args_list)} raw clips (will determine final count after generation)...")
             
             if clip_args_list:
-                # PHASE 1: Generate all raw clips (without calling styling yet)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    results = list(executor.map(
-                        generate_raw_clip_threadsafe, clip_args_list))
-                
+                # PHASE 1: Generate all raw clips using a single LR-ASD pass
+                results = generate_raw_clips_batched(
+                    base_dir=base_dir,
+                    original_video_path=str(video_path),
+                    s3_key=s3_key,
+                    clip_args_list=clip_args_list,
+                )
+
                 successful_raw_clips = [
                     r for r in results if r["status"] == "success"]
                 failed_raw_clips = [r for r in results if r["status"] == "error"]
@@ -674,10 +802,11 @@ class AiPodcastClipper:
                 if successful_raw_clips:
                     successful_raw_clips.sort(key=lambda x: x['index'])
                     
-                    # PHASE 2: Now call styling endpoint with correct clip numbers
+                    # PHASE 2: Send clips to styling service with correct metadata
                     actual_total_clips = len(successful_raw_clips)
                     print(f"📤 Sending {actual_total_clips} successful clips to styling service...")
                     
+                    styling_results = []
                     for idx, clip in enumerate(successful_raw_clips):
                         clip_number = idx + 1
                         is_last = (clip_number == actual_total_clips)
@@ -697,80 +826,37 @@ class AiPodcastClipper:
                             total_clips=actual_total_clips
                         )
                         
-                        # Update clip with styling results
-                        clip["styling_success"] = styling_success
-                        clip["styling_error"] = styling_error
-                        clip["styling_payload"] = styling_payload
-                        
+                        styling_results.append(styling_success)
                         print(f"📝 Clip {clip['index']}: clipIndex={clip_number}/{actual_total_clips}, isLastClip={is_last}, styling={'✅' if styling_success else '❌'}")
-                        
-                        # Collect payload for debugging
-                        if styling_payload:
-                            payloads.append({
-                                "clip_index": clip["index"],
-                                "payload": styling_payload
-                            })
                     
-                    styling_success_count = sum(
-                        1 for clip in successful_raw_clips if clip.get("styling_success"))
-                    styling_failed_count = sum(
-                        1 for clip in successful_raw_clips if not clip.get("styling_success"))
+                    # Check if any clips were successfully sent to styling
+                    successful_styling_count = sum(styling_results)
                     
-                    print(
-                        f"📤 Styling handoff complete: {styling_success_count} sent successfully, {styling_failed_count} failed")
+                    if successful_styling_count == 0:
+                        # All styling calls failed
+                        print(f"❌ All {actual_total_clips} clips failed to send to styling service")
+                    elif successful_styling_count < actual_total_clips:
+                        # Some styling calls failed
+                        print(f"⚠️ {successful_styling_count}/{actual_total_clips} clips sent to styling service successfully")
+                    else:
+                        # All styling calls succeeded
+                        print(f"✅ Job complete. {actual_total_clips} clips sent to styling service.")
                 
-                # Only send error webhook if ALL clips failed to generate raw
-                # Styling endpoint will handle success webhooks
+                # Log if all clips failed to generate raw
                 if failed_raw_clips and len(failed_raw_clips) == len(results):
                     # Catastrophic failure - all raw clips failed
-                    if request.webhook_url:
-                        print("⚠️ All clips failed - sending error webhook")
-                        send_completion_webhook(
-                            webhook_url=request.webhook_url,
-                            user_id=request.user_id,
-                            project_id=request.project_id,
-                            status="failed",
-                            error_message="All clips failed to generate. No clips could be processed from the video."
-                        )
-                else:
-                    # Some clips succeeded - styling endpoint will handle webhook
-                    print(
-                        f"✅ Job complete. {len(successful_raw_clips)} clips sent to styling service. Styling service will send completion webhook.")
+                    print("❌ All clips failed to generate raw clips")
                 
-                # Return payloads for local debugging
-                return payloads
+                return []
             else:
                 # No valid moments found
-                if request.webhook_url:
-                    print("⚠️ No valid moments found - sending error webhook")
-                    send_completion_webhook(
-                        webhook_url=request.webhook_url,
-                        user_id=request.user_id,
-                        project_id=request.project_id,
-                        status="failed",
-                        error_message="No valid clip moments could be identified from the video."
-                    )
+                print("⚠️ No valid moments found")
                 return []
 
         except Exception as e:
             print(f"Unhandled error during process_video: {e}")
             import traceback
             traceback.print_exc()
-            
-            # Send error webhook if processing failed
-            if hasattr(request, 'webhook_url') and request.webhook_url:
-                try:
-                    send_completion_webhook(
-                        webhook_url=request.webhook_url,
-                        user_id=request.user_id,
-                        project_id=request.project_id,
-                        status="failed",
-                        error_message=str(e)
-                    )
-                except Exception as webhook_error:
-                    logging.error(
-                        f"Failed to send error webhook: {webhook_error}")
-            
             return []
             
         finally:
@@ -822,7 +908,7 @@ class AiPodcastClipper:
 
     def transcribe_video(self, base_dir: str, video_path: str) -> str:
         audio_path = base_dir / 'audio.wav'
-        extract_cmd = f"ffmpeg -i {video_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
+        extract_cmd = f"ffmpeg -y -i {video_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
         subprocess.run(extract_cmd, shell=True,
                        check=True, capture_output=True)
 
@@ -934,51 +1020,72 @@ class AiPodcastClipper:
 
         pdf_url = "https://castclip.revolt-ai.com/app/Why%20clips%20went%20viral.pdf"
         pdf_data = httpx.get(pdf_url).content
-        max_retries = 2
+        max_retries = 2  # number of attempts for primary model before fallback
         clip_count_per_chunk = max(1, clip_count // len(valid_transcripts))
         results = []
 
         for chunk in valid_transcripts:
             prompt = self.get_prompt(chunk, clip_count_per_chunk)
+            primary_model = "gemini-2.5-pro"
+            fallback_model = "gemini-2.5-flash"
+
+            success = False
+
+            # Try primary model with retries and 5s backoff
             for attempt in range(1, max_retries + 1):
                 try:
                     response = self.gemini_client.models.generate_content(
-                        model="gemini-2.5-pro",
+                        model=primary_model,
                         config=types.GenerateContentConfig(safety_settings=[
-                            types.SafetySetting(
-                                category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
-                            types.SafetySetting(
-                                category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
-                            types.SafetySetting(
-                                category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
-                            types.SafetySetting(
-                                category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
+                            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
+                            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
+                            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
+                            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
                         ],
                             system_instruction="You are a Podcast Clip Extractor, tasked with creating clips for short-form platforms like TikTok and YouTube Shorts. Your goal is to identify and extract engaging stories, questions, and answers from podcast transcripts that will appeal to up-and-coming entrepreneurs seeking advice and motivation."),
                         contents=[
-                            types.Content(
-                                role="user",
-                                parts=[types.Part(text=prompt)]
-                            ),
-                            types.Part.from_bytes(
-                                data=pdf_data,
-                                mime_type="application/pdf"
-                            )
+                            types.Content(role="user", parts=[types.Part(text=prompt)]),
+                            types.Part.from_bytes(data=pdf_data, mime_type="application/pdf")
                         ]
                     )
 
                     if response.text:
                         results.append(response.text)
+                        success = True
                         break
                     else:
-                        print(
-                            f"Attempt {attempt}: Empty response.text from Gemini")
-
+                        print(f"Attempt {attempt} ({primary_model}): Empty response.text from Gemini")
                 except Exception as e:
-                    print(f"Attempt {attempt}: Gemini API call failed - {e}")
+                    print(f"Attempt {attempt} ({primary_model}) failed - {e}")
 
-                print("Retrying...")
-                time.sleep(2)
+                if attempt < max_retries:
+                    print("Retrying in 5 seconds...")
+                    time.sleep(5)
+
+            # Fallback to flash model if primary failed
+            if not success:
+                try:
+                    print(f"Falling back to {fallback_model}...")
+                    response = self.gemini_client.models.generate_content(
+                        model=fallback_model,
+                        config=types.GenerateContentConfig(safety_settings=[
+                            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
+                            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
+                            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
+                            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
+                        ],
+                            system_instruction="You are a Podcast Clip Extractor, tasked with creating clips for short-form platforms like TikTok and YouTube Shorts. Your goal is to identify and extract engaging stories, questions, and answers from podcast transcripts that will appeal to up-and-coming entrepreneurs seeking advice and motivation."),
+                        contents=[
+                            types.Content(role="user", parts=[types.Part(text=prompt)]),
+                            types.Part.from_bytes(data=pdf_data, mime_type="application/pdf")
+                        ]
+                    )
+                    if response.text:
+                        results.append(response.text)
+                    else:
+                        print(f"Fallback ({fallback_model}) produced empty response.text")
+                except Exception as e:
+                    print(f"Fallback ({fallback_model}) failed - {e}")
 
         return results if results else "[]"
 
@@ -989,18 +1096,21 @@ class AiPodcastClipper:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                                 detail="Incorrect Bearer Token", headers={"WWW-Authenticate": "Bearer"})
 
-        # Generate a job id and run synchronously (TEMPORARY - for debugging)
+        # Generate a job id
         run_id = str(uuid.uuid4())
         
-        # Run the job synchronously instead of background task
-        payloads = self._process_video_job(request.model_dump(), run_id)
+        # Immediately return 202 Accepted
+        # Processing will happen asynchronously and styling service will notify frontend
+        print(f"✅ Accepted job {run_id} - starting processing...")
+        
+        # Spawn the job in the background (Modal handles this)
+        self._process_video_job.spawn(request.model_dump(), run_id)
 
-        # Return success after processing completes with payloads
-        return JSONResponse(status_code=200, content={
+        # Return 202 Accepted immediately
+        return JSONResponse(status_code=202, content={
             "job_id": run_id,
-            "status": "completed",
-            "message": "Processing completed successfully.",
-            "payloads": payloads or []
+            "status": "accepted",
+            "message": "Video processing job accepted and started."
         })
 
 
@@ -1022,8 +1132,7 @@ def main():
         "user_id": "3zhHBEDMtMIEiRshOHkFSV72wKfdKkKI",
         "project_id": "123",
         "clip_count": 3,
-        "style": 1,
-        "webhook_url": "https://lampless-vincent-proscholastic.ngrok-free.app/webhooks/modal"
+        "style": 1
     }
     
     headers = {
