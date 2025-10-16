@@ -27,9 +27,23 @@ import logging
 from typing import Optional
 from fastapi.responses import JSONResponse
 
-os.environ.setdefault("PYANNOTE_AUDIO_DISABLE_CUDA", "True")
 
-
+def get_video_resolution(video_path: str) -> tuple[int, int]:
+    import json
+    import subprocess
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "json",
+        str(video_path)
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    data = json.loads(result.stdout)
+    width = data["streams"][0]["width"]
+    height = data["streams"][0]["height"]
+    return width, height
 
 
 class ProcessVideoRequest(BaseModel):
@@ -42,10 +56,7 @@ class ProcessVideoRequest(BaseModel):
 
 image = (modal.Image.from_registry(
     "nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.12")
-    .apt_install(["ffmpeg", "libgl1-mesa-glx", "wget", "libcudnn9-cuda-12", "libcudnn9-dev-cuda-12"])
-    .env({
-        "LD_LIBRARY_PATH": "/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}"
-    })
+    .apt_install(["ffmpeg", "libgl1-mesa-glx", "wget", "libcudnn8", "libcudnn8-dev"])
     .pip_install_from_requirements("requirements.txt")
     .add_local_dir("LR-ASD", "/LR-ASD", copy=True)
     .add_local_file("cookies.txt", "/cookies.txt"))
@@ -146,14 +157,20 @@ def call_styling_endpoint(
         return (False, error_msg, payload)
 
 
-def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path, output_path, framerate=25):
+def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path, output_path, framerate=25, hq_frames_path=None, scale_factor=1.0):
     target_width = 1080
     target_height = 1920
 
-    flist = glob.glob(os.path.join(pyframes_path, "*.jpg"))
-    flist.sort()
+    lq_flist = sorted(glob.glob(os.path.join(pyframes_path, "*.jpg")))
+    
+    if hq_frames_path:
+        hq_flist = sorted(glob.glob(os.path.join(hq_frames_path, "*.jpg")))
+        if not hq_flist:
+            hq_frames_path = None
+    else:
+        hq_flist = lq_flist
 
-    faces = [[] for _ in range(len(flist))]
+    faces = [[] for _ in range(len(lq_flist))]
 
     for tidx, track in enumerate(tracks):
         score_array = scores[tidx]
@@ -167,13 +184,18 @@ def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path,
             if 0 <= frame < len(faces):
                 faces[frame].append(
                     {'track': tidx, 'score': avg_score, 's': track['proc_track']["s"][fidx],
-                        'x': track['proc_track']["x"][fidx], 'y': track['proc_track']["y"][fidx]}
+                     'x': track['proc_track']["x"][fidx], 'y': track['proc_track']["y"][fidx]}
                 )
 
     temp_video_path = os.path.join(pyavi_path, "video_only.mp4")
 
     vout = None
-    for fidx, fname in tqdm(enumerate(flist), total=len(flist), desc="Creating vertical video"):
+    for fidx, fname_lq in tqdm(enumerate(lq_flist), total=len(lq_flist), desc="Creating vertical video"):
+        if hq_frames_path and fidx < len(hq_flist):
+            fname = hq_flist[fidx]
+        else:
+            fname = fname_lq
+
         img = cv2.imread(fname)
         if img is None:
             continue
@@ -232,19 +254,20 @@ def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path,
 
         elif mode == "crop":
             # Crop mode: Focus on the detected face (existing logic)
+            center_x_scaled = max_score_face["x"] * scale_factor
+            
             scale = target_height / img.shape[0]
             resized_image = cv2.resize(
                 img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
             frame_width = resized_image.shape[1]
-
-            center_x = int(
-                max_score_face["x"] * scale if max_score_face else frame_width // 2)
+            
+            center_x = int(center_x_scaled * scale)
             top_x = max(min(center_x - target_width // 2,
                         frame_width - target_width), 0)
 
             image_cropped = resized_image[0:target_height,
                                           top_x:top_x + target_width]
-
+            
             vout.write(image_cropped)
 
     if vout:
@@ -286,22 +309,49 @@ def compute_faces_by_frame(tracks, scores, num_frames: int):
     return faces
 
 
-def create_vertical_video_segment(faces_by_frame, pyframes_path: str, output_video_only_path: str, frame_start: int, frame_end: int, framerate: int = 25):
+def create_vertical_video_segment(
+    faces_by_frame, 
+    pyframes_path: str, 
+    output_video_only_path: str, 
+    frame_start: int, 
+    frame_end: int, 
+    framerate: int = 25,
+    hq_frames_path: Optional[str] = None,
+    scale_factor: float = 1.0
+):
     target_width = 1080
     target_height = 1920
 
-    flist = glob.glob(os.path.join(pyframes_path, "*.jpg"))
-    flist.sort()
+    lq_flist = sorted(glob.glob(os.path.join(pyframes_path, "*.jpg")))
+
+    if hq_frames_path:
+        hq_flist = sorted(glob.glob(os.path.join(hq_frames_path, "*.jpg")))
+        # Ensure HQ frames are available if requested
+        if not hq_flist:
+            print("Warning: HQ frames path provided but no frames found. Falling back to LQ.")
+            hq_frames_path = None 
+    else:
+        hq_flist = lq_flist
 
     vout = None
-    for frame_index in tqdm(range(frame_start, min(frame_end, len(flist))), total=max(0, frame_end - frame_start), desc="Rendering clip from batch frames"):
-        fname = flist[frame_index]
+    
+    # We iterate based on the LQ frame indices from the analysis
+    for frame_index in tqdm(range(frame_start, min(frame_end, len(lq_flist))), total=max(0, frame_end - frame_start), desc="Rendering clip from batch frames"):
+        
+        # Determine which frame to load (HQ or LQ)
+        if hq_frames_path and frame_index < len(hq_flist):
+            fname = hq_flist[frame_index]
+        else:
+            fname = lq_flist[frame_index]
+
         img = cv2.imread(fname)
         if img is None:
             continue
 
-        current_faces = faces_by_frame[frame_index] if frame_index < len(faces_by_frame) else []
-        max_score_face = max(current_faces, key=lambda face: face['score']) if current_faces else None
+        current_faces = faces_by_frame[frame_index] if frame_index < len(
+            faces_by_frame) else []
+        max_score_face = max(
+            current_faces, key=lambda face: face['score']) if current_faces else None
         if max_score_face and max_score_face['score'] < 0:
             max_score_face = None
 
@@ -314,12 +364,18 @@ def create_vertical_video_segment(faces_by_frame, pyframes_path: str, output_vid
             )
 
         if max_score_face:
+            # Scale face coordinates if using HQ frames
+            center_x_scaled = max_score_face["x"] * scale_factor
+            
             scale = target_height / img.shape[0]
-            resized_image = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            resized_image = cv2.resize(
+                img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
             frame_width = resized_image.shape[1]
-            center_x = int(max_score_face["x"] * scale)
-            top_x = max(min(center_x - target_width // 2, frame_width - target_width), 0)
-            image_cropped = resized_image[0:target_height, top_x:top_x + target_width]
+            center_x = int(center_x_scaled * scale) # Apply resize scale to center coordinate
+            top_x = max(
+                min(center_x - target_width // 2, frame_width - target_width), 0)
+            image_cropped = resized_image[0:target_height,
+                                          top_x:top_x + target_width]
             vout.write(image_cropped)
         else:
             scale = target_width / img.shape[1]
@@ -341,9 +397,9 @@ def create_vertical_video_segment(faces_by_frame, pyframes_path: str, output_vid
         vout.release()
 
 
-def build_batch_video(base_dir: pathlib.Path, original_video_path: str, clip_args_list: list[dict]) -> tuple[str, pathlib.Path, list[float]]:
+def build_batch_video(base_dir: pathlib.Path, original_video_path: str, analysis_video_path: str, clip_args_list: list[dict]) -> tuple[str, pathlib.Path, list[float]]:
     batch_name = "batch_input"
-    batch_video_path = base_dir / f"{batch_name}.mp4"
+    stitched_analysis_video_path = base_dir / f"{batch_name}.mp4" 
 
     segments_dir = base_dir / "batch_segments"
     segments_dir.mkdir(exist_ok=True)
@@ -358,21 +414,36 @@ def build_batch_video(base_dir: pathlib.Path, original_video_path: str, clip_arg
             end = args["end"]
             duration = max(end - start, 0)
             seg_path = segments_dir / f"seg_{idx:03d}.mp4"
-            cut_cmd = (f"ffmpeg -y -i {original_video_path} -ss {start} -t {duration} -c copy {seg_path}")
+            # Use the proxy to create the stitched clip for analysis
+            cut_cmd = (f"ffmpeg -y -i {analysis_video_path} -ss {start} -t {duration} -c copy {seg_path}")
             subprocess.run(cut_cmd, shell=True, check=True, capture_output=True, text=True)
             lf.write(f"file '{seg_path}'\n")
             offsets.append(current_offset)
             current_offset += duration
 
-    concat_cmd = (f"ffmpeg -y -f concat -safe 0 -i {list_file_path} -c copy {batch_video_path}")
+    concat_cmd = (f"ffmpeg -y -f concat -safe 0 -i {list_file_path} -c copy {stitched_analysis_video_path}")
     subprocess.run(concat_cmd, shell=True, check=True, capture_output=True, text=True)
 
-    return batch_name, batch_video_path, offsets
+    return batch_name, stitched_analysis_video_path, offsets
 
 
-def generate_raw_clips_batched(base_dir: pathlib.Path, original_video_path: str, s3_key: str, clip_args_list: list[dict]) -> list[dict]:
+def generate_raw_clips_batched(base_dir: pathlib.Path, original_video_path: str, proxy_video_path: str, s3_key: str, clip_args_list: list[dict]) -> list[dict]:
     try:
-        batch_name, batch_video_path, offsets = build_batch_video(base_dir, original_video_path, clip_args_list)
+        # --- HQ Frame Extraction ---
+        hq_width, hq_height = get_video_resolution(original_video_path)
+        proxy_width, proxy_height = get_video_resolution(proxy_video_path)
+        scale_factor = hq_width / proxy_width
+        
+        # Extract HQ frames for later use in rendering
+        hq_frames_dir = base_dir / "hq_frames"
+        hq_frames_dir.mkdir(exist_ok=True)
+        print("Extracting HQ frames for final render...")
+        hq_extract_cmd = f"ffmpeg -y -i {original_video_path} -qscale:v 2 -f image2 {hq_frames_dir}/%06d.jpg"
+        subprocess.run(hq_extract_cmd, shell=True, check=True, capture_output=True)
+        # --- End HQ Frame Extraction ---
+
+        batch_name, batch_video_path, offsets = build_batch_video(
+            base_dir, original_video_path, proxy_video_path, clip_args_list)
 
         columbia_command = (f"python Columbia_test.py --videoName {batch_name} "
                             f"--videoFolder {str(base_dir)} "
@@ -433,6 +504,8 @@ def generate_raw_clips_batched(base_dir: pathlib.Path, original_video_path: str,
                     frame_start=frame_start,
                     frame_end=frame_end,
                     framerate=framerate,
+                    hq_frames_path=str(hq_frames_dir),
+                    scale_factor=scale_factor
                 )
 
                 try:
@@ -498,6 +571,7 @@ def generate_raw_clips_batched(base_dir: pathlib.Path, original_video_path: str,
 
 def generate_raw_clip(base_dir: pathlib.Path,
                                original_video_path: str,
+                               proxy_video_path: str,
                                s3_key: str,
                                start_time: float,
                                end_time: float,
@@ -537,7 +611,7 @@ def generate_raw_clip(base_dir: pathlib.Path,
     extract_cmd = f"ffmpeg -y -i {clip_segment_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
     subprocess.run(extract_cmd, shell=True, check=True, capture_output=True)
 
-    shutil.copy(clip_segment_path, base_dir / f"{clip_name}.mp4")
+    shutil.copy(proxy_video_path, base_dir / f"{clip_name}.mp4")
 
     columbia_command = (f"python Columbia_test.py --videoName {clip_name} "
                         f"--videoFolder {str(base_dir)} "
@@ -593,6 +667,7 @@ def generate_raw_clip_threadsafe(args):
         raw_clip_url, output_s3_key = generate_raw_clip(
             base_dir=args["base_dir"],
             original_video_path=args["video_path"],
+            proxy_video_path=args["proxy_video_path"],
             s3_key=args["s3_key"],
             start_time=args["start"],
             end_time=args["end"],
@@ -672,13 +747,11 @@ class AiPodcastClipper:
             if request.s3_key.startswith("http://") or request.s3_key.startswith("https://"):
                 print("Detected YouTube URL, starting download...")
                 try:
-                    self.download_youtube_video(request.s3_key, video_path)
+                    video_path, proxy_video_path = self.download_youtube_video(request.s3_key, base_dir)
                     s3_key = f"{request.user_id}/{request.project_id}/input.mp4"
                 except HTTPException:
-                    # Re-raise the specific YouTube error
                     raise
                 except Exception as e:
-                    # Catch any other unexpected errors
                     raise HTTPException(
                         status_code=422,
                         detail={
@@ -689,6 +762,8 @@ class AiPodcastClipper:
                     )
             else:
                 print("Downloading video from S3...")
+                video_path = base_dir / "input.mp4"
+                proxy_video_path = None # Will be created after download
                 s3_client = boto3.client(
                     "s3",
                     aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
@@ -698,6 +773,13 @@ class AiPodcastClipper:
                 )
                 s3_client.download_file(
                     "ai-podcast-clipper", s3_key, str(video_path))
+            
+            if proxy_video_path is None:
+                # This handles S3 files, or YouTube downloads that failed to get an LQ version
+                print("Creating low-resolution proxy video for analysis...")
+                proxy_video_path = base_dir / "input_proxy.mp4"
+                proxy_command = (f"ffmpeg -y -i {video_path} -vf scale=480:-1 -r 15 -c:v h264 -preset ultrafast {proxy_video_path}")
+                subprocess.run(proxy_command, shell=True, check=True, capture_output=True)
 
             # 1. Transcription
             transcript_segments_json = self.transcribe_video(
@@ -756,6 +838,7 @@ class AiPodcastClipper:
                         clip_args_list.append({
                             "base_dir": base_dir,
                             "video_path": str(video_path),
+                            "proxy_video_path": str(proxy_video_path),
                             "s3_key": s3_key,
                             "start": moment["start"],
                             "end": moment["end"],
@@ -781,6 +864,7 @@ class AiPodcastClipper:
                 results = generate_raw_clips_batched(
                     base_dir=base_dir,
                     original_video_path=str(video_path),
+                    proxy_video_path=str(proxy_video_path),
                     s3_key=s3_key,
                     clip_args_list=clip_args_list,
                 )
@@ -869,42 +953,62 @@ class AiPodcastClipper:
             except Exception as cleanup_err:
                 logging.error(f"Cleanup error: {cleanup_err}")
 
-    def download_youtube_video(self, youtube_url: str, output_path: pathlib.Path):
-        ydl_opts = {
-            'format': 'bv*+ba/b',  # More flexible format selection
-            'outtmpl': str(output_path),
+    def download_youtube_video(self, youtube_url: str, base_dir: pathlib.Path) -> tuple[pathlib.Path, Optional[pathlib.Path]]:
+        hq_path = base_dir / "input_hq.mp4"
+        lq_path = base_dir / "input_lq.mp4"
+
+        # Download High Quality
+        print("Downloading HQ YouTube video...")
+        ydl_opts_hq = {
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'outtmpl': str(hq_path),
             'merge_output_format': 'mp4',
-            'quiet': False,  # Enable logging to see what's happening
+            'quiet': False,
             'noplaylist': True,
             'nocheckcertificate': True,
-            'retries': 3,  # Increase retries
+            'retries': 3,
             'cookiefile': '/cookies.txt',
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
         }
         try:
-            with YoutubeDL(ydl_opts) as ydl:
-                # First, try to extract info without downloading
-                info = ydl.extract_info(youtube_url, download=False)
-                
-                # Check if video is available
-                if not info.get('formats'):
-                    raise Exception("No video formats available")
-                    
-                # Now download
+            with YoutubeDL(ydl_opts_hq) as ydl:
                 ydl.download([youtube_url])
-                return info.get("title", "Untitled Video")
+            if not hq_path.exists():
+                raise FileNotFoundError("HQ YouTube download did not create a file.")
         except Exception as e:
-            print(f"YouTube download error: {str(e)}")
+            print(f"HQ YouTube download error: {str(e)}")
             raise HTTPException(
-                status_code=422, 
+                status_code=422,
                 detail={
                     "error_type": "youtube_download_failed",
-                    "message": "Failed to download YouTube video. This could be due to bot protection, private video, or invalid URL.",
+                    "message": "Failed to download high-quality YouTube video.",
                     "original_error": str(e)
                 }
             )
+
+        # Download Low Quality
+        print("Downloading LQ YouTube video for proxy...")
+        ydl_opts_lq = {
+            'format': 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best',
+            'outtmpl': str(lq_path),
+            'merge_output_format': 'mp4',
+            'quiet': False,
+            'noplaylist': True,
+            'nocheckcertificate': True,
+            'retries': 3,
+            'cookiefile': '/cookies.txt',
+        }
+        try:
+            with YoutubeDL(ydl_opts_lq) as ydl:
+                ydl.download([youtube_url])
+            if not lq_path.exists():
+                print("LQ YouTube download did not create a file, will generate proxy manually.")
+                return hq_path, None
+        except Exception as e:
+            print(f"LQ YouTube download failed: {str(e)}. Will generate proxy manually.")
+            return hq_path, None
+
+        return hq_path, lq_path
+
 
     def transcribe_video(self, base_dir: str, video_path: str) -> str:
         audio_path = base_dir / 'audio.wav'
