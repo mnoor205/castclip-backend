@@ -28,24 +28,6 @@ from typing import Optional
 from fastapi.responses import JSONResponse
 
 
-def get_video_resolution(video_path: str) -> tuple[int, int]:
-    import json
-    import subprocess
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height",
-        "-of", "json",
-        str(video_path)
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    data = json.loads(result.stdout)
-    width = data["streams"][0]["width"]
-    height = data["streams"][0]["height"]
-    return width, height
-
-
 class ProcessVideoRequest(BaseModel):
     s3_key: str
     user_id: str
@@ -157,20 +139,14 @@ def call_styling_endpoint(
         return (False, error_msg, payload)
 
 
-def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path, output_path, framerate=25, hq_frames_path=None, scale_factor=1.0):
+def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path, output_path, framerate=25):
     target_width = 1080
     target_height = 1920
 
-    lq_flist = sorted(glob.glob(os.path.join(pyframes_path, "*.jpg")))
-    
-    if hq_frames_path:
-        hq_flist = sorted(glob.glob(os.path.join(hq_frames_path, "*.jpg")))
-        if not hq_flist:
-            hq_frames_path = None
-    else:
-        hq_flist = lq_flist
+    flist = glob.glob(os.path.join(pyframes_path, "*.jpg"))
+    flist.sort()
 
-    faces = [[] for _ in range(len(lq_flist))]
+    faces = [[] for _ in range(len(flist))]
 
     for tidx, track in enumerate(tracks):
         score_array = scores[tidx]
@@ -184,18 +160,13 @@ def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path,
             if 0 <= frame < len(faces):
                 faces[frame].append(
                     {'track': tidx, 'score': avg_score, 's': track['proc_track']["s"][fidx],
-                     'x': track['proc_track']["x"][fidx], 'y': track['proc_track']["y"][fidx]}
+                        'x': track['proc_track']["x"][fidx], 'y': track['proc_track']["y"][fidx]}
                 )
 
     temp_video_path = os.path.join(pyavi_path, "video_only.mp4")
 
     vout = None
-    for fidx, fname_lq in tqdm(enumerate(lq_flist), total=len(lq_flist), desc="Creating vertical video"):
-        if hq_frames_path and fidx < len(hq_flist):
-            fname = hq_flist[fidx]
-        else:
-            fname = fname_lq
-
+    for fidx, fname in tqdm(enumerate(flist), total=len(flist), desc="Creating vertical video"):
         img = cv2.imread(fname)
         if img is None:
             continue
@@ -254,20 +225,19 @@ def create_vertical_video(tracks, scores, pyframes_path, pyavi_path, audio_path,
 
         elif mode == "crop":
             # Crop mode: Focus on the detected face (existing logic)
-            center_x_scaled = max_score_face["x"] * scale_factor
-            
             scale = target_height / img.shape[0]
             resized_image = cv2.resize(
                 img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
             frame_width = resized_image.shape[1]
-            
-            center_x = int(center_x_scaled * scale)
+
+            center_x = int(
+                max_score_face["x"] * scale if max_score_face else frame_width // 2)
             top_x = max(min(center_x - target_width // 2,
                         frame_width - target_width), 0)
 
             image_cropped = resized_image[0:target_height,
                                           top_x:top_x + target_width]
-            
+
             vout.write(image_cropped)
 
     if vout:
@@ -309,49 +279,22 @@ def compute_faces_by_frame(tracks, scores, num_frames: int):
     return faces
 
 
-def create_vertical_video_segment(
-    faces_by_frame, 
-    pyframes_path: str, 
-    output_video_only_path: str, 
-    frame_start: int, 
-    frame_end: int, 
-    framerate: int = 25,
-    hq_frames_path: Optional[str] = None,
-    scale_factor: float = 1.0
-):
+def create_vertical_video_segment(faces_by_frame, pyframes_path: str, output_video_only_path: str, frame_start: int, frame_end: int, framerate: int = 25):
     target_width = 1080
     target_height = 1920
 
-    lq_flist = sorted(glob.glob(os.path.join(pyframes_path, "*.jpg")))
-
-    if hq_frames_path:
-        hq_flist = sorted(glob.glob(os.path.join(hq_frames_path, "*.jpg")))
-        # Ensure HQ frames are available if requested
-        if not hq_flist:
-            print("Warning: HQ frames path provided but no frames found. Falling back to LQ.")
-            hq_frames_path = None 
-    else:
-        hq_flist = lq_flist
+    flist = glob.glob(os.path.join(pyframes_path, "*.jpg"))
+    flist.sort()
 
     vout = None
-    
-    # We iterate based on the LQ frame indices from the analysis
-    for frame_index in tqdm(range(frame_start, min(frame_end, len(lq_flist))), total=max(0, frame_end - frame_start), desc="Rendering clip from batch frames"):
-        
-        # Determine which frame to load (HQ or LQ)
-        if hq_frames_path and frame_index < len(hq_flist):
-            fname = hq_flist[frame_index]
-        else:
-            fname = lq_flist[frame_index]
-
+    for frame_index in tqdm(range(frame_start, min(frame_end, len(flist))), total=max(0, frame_end - frame_start), desc="Rendering clip from batch frames"):
+        fname = flist[frame_index]
         img = cv2.imread(fname)
         if img is None:
             continue
 
-        current_faces = faces_by_frame[frame_index] if frame_index < len(
-            faces_by_frame) else []
-        max_score_face = max(
-            current_faces, key=lambda face: face['score']) if current_faces else None
+        current_faces = faces_by_frame[frame_index] if frame_index < len(faces_by_frame) else []
+        max_score_face = max(current_faces, key=lambda face: face['score']) if current_faces else None
         if max_score_face and max_score_face['score'] < 0:
             max_score_face = None
 
@@ -364,18 +307,12 @@ def create_vertical_video_segment(
             )
 
         if max_score_face:
-            # Scale face coordinates if using HQ frames
-            center_x_scaled = max_score_face["x"] * scale_factor
-            
             scale = target_height / img.shape[0]
-            resized_image = cv2.resize(
-                img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            resized_image = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
             frame_width = resized_image.shape[1]
-            center_x = int(center_x_scaled * scale) # Apply resize scale to center coordinate
-            top_x = max(
-                min(center_x - target_width // 2, frame_width - target_width), 0)
-            image_cropped = resized_image[0:target_height,
-                                          top_x:top_x + target_width]
+            center_x = int(max_score_face["x"] * scale)
+            top_x = max(min(center_x - target_width // 2, frame_width - target_width), 0)
+            image_cropped = resized_image[0:target_height, top_x:top_x + target_width]
             vout.write(image_cropped)
         else:
             scale = target_width / img.shape[1]
@@ -429,21 +366,7 @@ def build_batch_video(base_dir: pathlib.Path, original_video_path: str, analysis
 
 def generate_raw_clips_batched(base_dir: pathlib.Path, original_video_path: str, proxy_video_path: str, s3_key: str, clip_args_list: list[dict]) -> list[dict]:
     try:
-        # --- HQ Frame Extraction ---
-        hq_width, hq_height = get_video_resolution(original_video_path)
-        proxy_width, proxy_height = get_video_resolution(proxy_video_path)
-        scale_factor = hq_width / proxy_width
-        
-        # Extract HQ frames for later use in rendering
-        hq_frames_dir = base_dir / "hq_frames"
-        hq_frames_dir.mkdir(exist_ok=True)
-        print("Extracting HQ frames for final render...")
-        hq_extract_cmd = f"ffmpeg -y -i {original_video_path} -qscale:v 2 -f image2 {hq_frames_dir}/%06d.jpg"
-        subprocess.run(hq_extract_cmd, shell=True, check=True, capture_output=True)
-        # --- End HQ Frame Extraction ---
-
-        batch_name, batch_video_path, offsets = build_batch_video(
-            base_dir, original_video_path, proxy_video_path, clip_args_list)
+        batch_name, batch_video_path, offsets = build_batch_video(base_dir, original_video_path, proxy_video_path, clip_args_list)
 
         columbia_command = (f"python Columbia_test.py --videoName {batch_name} "
                             f"--videoFolder {str(base_dir)} "
@@ -504,8 +427,6 @@ def generate_raw_clips_batched(base_dir: pathlib.Path, original_video_path: str,
                     frame_start=frame_start,
                     frame_end=frame_end,
                     framerate=framerate,
-                    hq_frames_path=str(hq_frames_dir),
-                    scale_factor=scale_factor
                 )
 
                 try:
